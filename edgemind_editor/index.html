@@ -1,0 +1,994 @@
+## index.html             
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+    * { box-sizing: border-box; }
+
+    body {
+        margin: 0;
+        padding: 10px;
+        background: #111827;
+        color: white;
+        font-family: Arial, sans-serif;
+        user-select: none;
+        overflow: hidden;
+    }
+
+    .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 10px;
+        align-items: center;
+    }
+
+    button {
+        border: 0;
+        border-radius: 6px;
+        padding: 9px 13px;
+        background: #374151;
+        color: white;
+        cursor: pointer;
+        font-weight: 600;
+    }
+
+    button:hover { background: #4b5563; }
+    button.primary { background: #2563eb; }
+    button.danger { background: #991b1b; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #status {
+        color: #cbd5e1;
+        font-size: 12px;
+        margin-left: auto;
+    }
+
+    .canvas-wrap {
+        width: 100%;
+        overflow: hidden;
+        border: 1px solid #475569;
+        border-radius: 8px;
+        background: #1f2937;
+    }
+
+    canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        touch-action: none;
+        cursor: crosshair;
+    }
+
+    .help {
+        margin-top: 8px;
+        color: #9ca3af;
+        font-size: 12px;
+    }
+</style>
+</head>
+
+<body>
+
+<div class="toolbar">
+    <button class="primary" id="addCar">+ Add car</button>
+    <button id="addCone">+ Add cone</button>
+    <button id="addBarrier">+ Add barrier</button>
+    <button class="danger" id="deleteObject">Delete selected</button>
+    <button id="resetObjects">Reset objects</button>
+    <span id="status">Select an object to move it.</span>
+</div>
+
+<div class="canvas-wrap">
+    <canvas id="worldCanvas" width="900" height="600"></canvas>
+</div>
+
+<div class="help">
+    Drag objects to move them. Objects snap to the nearest grid cell when released.
+    Navigation uses the grid cell containing each object's centre.
+    Select an object and use Delete selected to remove it.
+</div>
+
+<script>
+(() => {
+    "use strict";
+
+    // --------------------------------------------------
+    // CONFIGURATION
+    // --------------------------------------------------
+
+    const GRID = 20;
+    const WIDTH = 900;
+    const HEIGHT = 600;
+
+    const CELL_W = WIDTH / GRID;
+    const CELL_H = HEIGHT / GRID;
+
+    const DEFAULT_SIZE = 55;
+    const SPAWN_DISTANCE = 42;
+
+    const canvas = document.getElementById("worldCanvas");
+    const ctx = canvas.getContext("2d");
+    const statusText = document.getElementById("status");
+
+    let objects = [];
+    let route = [];
+
+    let backgroundData = null;
+    let sprites = {};
+
+    let selectedId = null;
+    let draggingId = null;
+    let activePointerId = null;
+
+    let dragOffsetX = 0;
+    let dragOffsetY = 0;
+
+    let nextId = 1;
+    let lastSent = "";
+
+    // FIX: hold objects Python sent while we were dragging so a dynamic
+    // obstacle spawned mid-drag isn't deleted on release.
+    let pendingIncoming = null;
+
+    const imageCache = {};
+
+    // --------------------------------------------------
+    // IMAGE LOADING
+    // --------------------------------------------------
+
+    function getImage(source) {
+        if (!source || typeof source !== "string") return null;
+
+        if (!imageCache[source]) {
+            const image = new Image();
+            image.src = source;
+            imageCache[source] = image;
+
+            image.onload = () => {
+                draw();
+                setFrameHeight();
+            };
+        }
+
+        const image = imageCache[source];
+
+        return image.complete && image.naturalWidth > 0
+            ? image
+            : null;
+    }
+
+    function getSprite(type) {
+        return getImage(sprites[type]);
+    }
+
+    // --------------------------------------------------
+    // COMPONENT COMMUNICATION
+    // --------------------------------------------------
+
+    function serializeObjects(list) {
+        return JSON.stringify(
+            list.map(obj => ({
+                id: obj.id,
+                type: obj.type,
+                x: obj.x,
+                y: obj.y,
+                size: obj.size
+            }))
+        );
+    }
+
+    function sendValue() {
+        const serialized = serializeObjects(objects);
+
+        if (serialized === lastSent) return;
+
+        lastSent = serialized;
+
+        window.parent.postMessage({
+            isStreamlitMessage: true,
+            type: "streamlit:setComponentValue",
+            value: objects.map(obj => ({
+                id: obj.id,
+                type: obj.type,
+                x: obj.x,
+                y: obj.y,
+                size: obj.size
+            }))
+        }, "*");
+    }
+
+    function setFrameHeight() {
+        const height = Math.max(
+            document.body.scrollHeight,
+            document.documentElement.scrollHeight
+        );
+
+        window.parent.postMessage({
+            isStreamlitMessage: true,
+            type: "streamlit:setFrameHeight",
+            height: height
+        }, "*");
+    }
+
+    // --------------------------------------------------
+    // GRID HELPERS
+    // --------------------------------------------------
+
+    function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+    }
+
+    function pixelToGrid(x, y) {
+        return {
+            x: clamp(Math.floor(x / CELL_W), 0, GRID - 1),
+            y: clamp(Math.floor(y / CELL_H), 0, GRID - 1)
+        };
+    }
+
+    function snapToGrid(x, y) {
+        const cell = pixelToGrid(x, y);
+
+        return {
+            x: cell.x * CELL_W + CELL_W / 2,
+            y: cell.y * CELL_H + CELL_H / 2
+        };
+    }
+
+    // --------------------------------------------------
+    // POINTER POSITION
+    // --------------------------------------------------
+
+    function pointerPosition(event) {
+        const rect = canvas.getBoundingClientRect();
+
+        const scaleX = WIDTH / rect.width;
+        const scaleY = HEIGHT / rect.height;
+
+        return {
+            x: (event.clientX - rect.left) * scaleX,
+            y: (event.clientY - rect.top) * scaleY
+        };
+    }
+
+    // --------------------------------------------------
+    // INCOMING DATA SANITIZING
+    // --------------------------------------------------
+
+    function sanitizeObjects(list) {
+        if (!Array.isArray(list)) return [];
+
+        return list
+            .filter(obj => obj && typeof obj === "object")
+            .map((obj, index) => {
+                const x = Number(obj.x);
+                const y = Number(obj.y);
+                const size = Number(obj.size);
+
+                return {
+                    id: (obj.id !== null && obj.id !== undefined && obj.id !== "")
+                        ? String(obj.id)
+                        : "object_auto_" + (index + 1),
+
+                    type: (typeof obj.type === "string" && obj.type)
+                        ? obj.type
+                        : "car",
+
+                    x: clamp(
+                        Number.isFinite(x) ? x : WIDTH / 2,
+                        CELL_W / 2,
+                        WIDTH - CELL_W / 2
+                    ),
+
+                    y: clamp(
+                        Number.isFinite(y) ? y : HEIGHT / 2,
+                        CELL_H / 2,
+                        HEIGHT - CELL_H / 2
+                    ),
+
+                    size: (Number.isFinite(size) && size > 0)
+                        ? size
+                        : DEFAULT_SIZE
+                };
+            });
+    }
+
+    function sanitizeRoute(list) {
+        if (!Array.isArray(list)) return [];
+
+        return list
+            .filter(point => Array.isArray(point) && point.length >= 2)
+            .map(point => [Number(point[0]), Number(point[1])])
+            .filter(point =>
+                Number.isFinite(point[0]) &&
+                Number.isFinite(point[1])
+            );
+    }
+
+    function highestId(list) {
+        return list.reduce((max, obj) => {
+            const match = String(obj.id).match(/\d+/g);
+
+            if (!match) return max;
+
+            const value = parseInt(match[match.length - 1], 10);
+
+            return Number.isFinite(value)
+                ? Math.max(max, value)
+                : max;
+        }, 0);
+    }
+
+    // --------------------------------------------------
+    // UNIQUE SPAWN POSITIONS
+    // --------------------------------------------------
+
+    function findSpawnPosition() {
+        const candidates = [];
+
+        // Search cells in a spread-out pattern.
+        for (let row = 1; row < GRID - 1; row += 2) {
+            for (let col = 1; col < GRID - 1; col += 2) {
+                candidates.push({
+                    x: col * CELL_W + CELL_W / 2,
+                    y: row * CELL_H + CELL_H / 2
+                });
+            }
+        }
+
+        // Prefer positions far from existing objects.
+        for (const candidate of candidates) {
+            const occupied = objects.some(obj => {
+                return Math.hypot(
+                    obj.x - candidate.x,
+                    obj.y - candidate.y
+                ) < SPAWN_DISTANCE;
+            });
+
+            if (!occupied) return candidate;
+        }
+
+        // Fallback: check every cell.
+        for (let row = 0; row < GRID; row++) {
+            for (let col = 0; col < GRID; col++) {
+                const candidate = {
+                    x: col * CELL_W + CELL_W / 2,
+                    y: row * CELL_H + CELL_H / 2
+                };
+
+                const occupied = objects.some(obj => {
+                    return Math.hypot(
+                        obj.x - candidate.x,
+                        obj.y - candidate.y
+                    ) < SPAWN_DISTANCE;
+                });
+
+                if (!occupied) return candidate;
+            }
+        }
+
+        return {
+            x: CELL_W / 2,
+            y: CELL_H / 2
+        };
+    }
+
+    // --------------------------------------------------
+    // DRAW BACKGROUND
+    // --------------------------------------------------
+
+    function drawBackground() {
+        ctx.fillStyle = "#e5e7eb";
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+        const image = getImage(backgroundData);
+
+        if (image) {
+            ctx.drawImage(image, 0, 0, WIDTH, HEIGHT);
+        }
+    }
+
+    // --------------------------------------------------
+    // DRAW GRID
+    // --------------------------------------------------
+
+    function drawGrid() {
+        ctx.save();
+
+        ctx.strokeStyle = "rgba(30, 41, 59, 0.35)";
+        ctx.lineWidth = 1;
+
+        for (let i = 0; i <= GRID; i++) {
+            const x = i * CELL_W;
+            const y = i * CELL_H;
+
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, HEIGHT);
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(WIDTH, y);
+            ctx.stroke();
+        }
+
+        ctx.restore();
+    }
+
+    // --------------------------------------------------
+    // PARKING ZONES
+    // --------------------------------------------------
+
+    function drawParkingZones() {
+        const zones = [
+            { name: "A", x: 18, y: 3, color: "#16a34a" },
+            { name: "B", x: 18, y: 10, color: "#2563eb" },
+            { name: "C", x: 18, y: 17, color: "#9333ea" }
+        ];
+
+        zones.forEach(zone => {
+            const x = zone.x * CELL_W;
+            const y = zone.y * CELL_H;
+
+            ctx.fillStyle = zone.color;
+            ctx.globalAlpha = 0.25;
+            ctx.fillRect(x, y, CELL_W, CELL_H);
+            ctx.globalAlpha = 1;
+
+            ctx.strokeStyle = zone.color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, CELL_W, CELL_H);
+
+            ctx.fillStyle = "#111827";
+            ctx.font = "bold 12px Arial";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+
+            ctx.fillText(
+                "P" + zone.name,
+                x + CELL_W / 2,
+                y + CELL_H / 2
+            );
+        });
+    }
+
+    // --------------------------------------------------
+    // DRAW ROUTE
+    // --------------------------------------------------
+
+    function drawRoute() {
+        if (!Array.isArray(route) || route.length === 0) return;
+
+        ctx.save();
+
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 5;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+
+        ctx.beginPath();
+
+        route.forEach((point, index) => {
+            const x = (point[0] + 0.5) * CELL_W;
+            const y = (point[1] + 0.5) * CELL_H;
+
+            if (index === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        });
+
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // --------------------------------------------------
+    // OBJECT DRAWING
+    // --------------------------------------------------
+
+    function objectDimensions(obj) {
+        const size = Number(obj && obj.size);
+
+        const scale = clamp(
+            ((Number.isFinite(size) && size > 0)
+                ? size
+                : DEFAULT_SIZE) / DEFAULT_SIZE,
+            0.3,
+            1.5
+        );
+
+        return {
+            width: CELL_W * 0.82 * scale,
+            height: CELL_H * 0.82 * scale
+        };
+    }
+
+    function drawObject(obj) {
+        const dimensions = objectDimensions(obj);
+
+        const width = dimensions.width;
+        const height = dimensions.height;
+
+        const x = obj.x - width / 2;
+        const y = obj.y - height / 2;
+
+        const sprite = getSprite(obj.type);
+
+        ctx.save();
+
+        if (sprite) {
+            ctx.drawImage(sprite, x, y, width, height);
+        } else {
+            const colors = {
+                car: "#2563eb",
+                cone: "#f97316",
+                barrier: "#dc2626"
+            };
+
+            ctx.fillStyle = colors[obj.type] || "#64748b";
+
+            if (obj.type === "car") {
+                ctx.fillRect(x, y, width, height);
+
+                ctx.fillStyle = "#bfdbfe";
+                ctx.fillRect(
+                    x + width * 0.2,
+                    y + height * 0.2,
+                    width * 0.6,
+                    height * 0.6
+                );
+
+            } else if (obj.type === "cone") {
+                ctx.beginPath();
+                ctx.moveTo(obj.x, y);
+                ctx.lineTo(x + width, y + height);
+                ctx.lineTo(x, y + height);
+                ctx.closePath();
+                ctx.fill();
+
+            } else {
+                ctx.fillRect(x, y, width, height);
+
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 2;
+
+                ctx.beginPath();
+                ctx.moveTo(x + 3, y + height - 3);
+                ctx.lineTo(x + width - 3, y + 3);
+                ctx.stroke();
+            }
+        }
+
+        if (obj.id === selectedId) {
+            ctx.strokeStyle = "#facc15";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x - 3, y - 3, width + 6, height + 6);
+        }
+
+        ctx.restore();
+    }
+
+    function drawObjects() {
+        objects.forEach(drawObject);
+    }
+
+    // --------------------------------------------------
+    // MAIN DRAW
+    // --------------------------------------------------
+
+    function draw() {
+        try {
+            ctx.clearRect(0, 0, WIDTH, HEIGHT);
+
+            drawBackground();
+            drawParkingZones();
+            drawGrid();
+            drawRoute();
+            drawObjects();
+
+        } catch (error) {
+            console.error("Canvas draw failed:", error);
+        }
+    }
+
+    // --------------------------------------------------
+    // OBJECT CREATION
+    // --------------------------------------------------
+
+    function addObject(type) {
+        let id;
+
+        do {
+            id = "object_" + nextId++;
+        } while (objects.some(obj => obj.id === id));
+
+        const position = findSpawnPosition();
+
+        const obj = {
+            id: id,
+            type: type,
+            x: position.x,
+            y: position.y,
+            size: DEFAULT_SIZE
+        };
+
+        objects.push(obj);
+        selectedId = obj.id;
+
+        statusText.textContent =
+            type.charAt(0).toUpperCase() +
+            type.slice(1) +
+            " added at a free position.";
+
+        draw();
+        sendValue();
+    }
+
+    function bindButton(id, handler) {
+        const element = document.getElementById(id);
+
+        if (!element) return;
+
+        element.addEventListener("click", event => {
+            handler();
+
+            if (event.currentTarget && event.currentTarget.blur) {
+                event.currentTarget.blur();
+            }
+        });
+    }
+
+    bindButton("addCar", () => addObject("car"));
+    bindButton("addCone", () => addObject("cone"));
+    bindButton("addBarrier", () => addObject("barrier"));
+
+    // --------------------------------------------------
+    // OBJECT SELECTION
+    // --------------------------------------------------
+
+    function findObjectAt(x, y) {
+        for (let i = objects.length - 1; i >= 0; i--) {
+            const obj = objects[i];
+            const dimensions = objectDimensions(obj);
+
+            const halfWidth = dimensions.width / 2;
+            const halfHeight = dimensions.height / 2;
+
+            if (
+                Math.abs(x - obj.x) <= halfWidth + 5 &&
+                Math.abs(y - obj.y) <= halfHeight + 5
+            ) {
+                return obj;
+            }
+        }
+
+        return null;
+    }
+
+    // --------------------------------------------------
+    // DRAGGING
+    // --------------------------------------------------
+
+    canvas.addEventListener("pointerdown", event => {
+        if (event.pointerType === "mouse" && event.button !== 0) {
+            return;
+        }
+
+        if (draggingId !== null) return;
+
+        const position = pointerPosition(event);
+        const found = findObjectAt(position.x, position.y);
+
+        if (!found) {
+            selectedId = null;
+            draw();
+            return;
+        }
+
+        selectedId = found.id;
+        draggingId = found.id;
+        activePointerId = event.pointerId;
+
+        // Preserve where the object was grabbed.
+        dragOffsetX = found.x - position.x;
+        dragOffsetY = found.y - position.y;
+
+        try {
+            canvas.setPointerCapture(event.pointerId);
+        } catch (error) {
+            console.warn("Pointer capture unavailable:", error);
+        }
+
+        statusText.textContent = "Moving " + found.type + "...";
+
+        draw();
+        event.preventDefault();
+    });
+
+    function updateDraggedObject(event, snap = false) {
+        if (
+            draggingId === null ||
+            activePointerId === null ||
+            event.pointerId !== activePointerId
+        ) {
+            return;
+        }
+
+        const obj = objects.find(item => item.id === draggingId);
+        if (!obj) return;
+
+        const position = pointerPosition(event);
+
+        const rawX = clamp(
+            position.x + dragOffsetX,
+            CELL_W / 2,
+            WIDTH - CELL_W / 2
+        );
+
+        const rawY = clamp(
+            position.y + dragOffsetY,
+            CELL_H / 2,
+            HEIGHT - CELL_H / 2
+        );
+
+        if (snap) {
+            const snapped = snapToGrid(rawX, rawY);
+            obj.x = snapped.x;
+            obj.y = snapped.y;
+        } else {
+            obj.x = rawX;
+            obj.y = rawY;
+        }
+
+        draw();
+    }
+
+    window.addEventListener("pointermove", event => {
+        if (draggingId === null) return;
+
+        updateDraggedObject(event, false);
+        event.preventDefault();
+
+    }, { passive: false });
+
+    function stopDragging(event) {
+        if (draggingId === null || activePointerId === null) return;
+
+        if (event && event.pointerId !== activePointerId) return;
+
+        const pointerId = activePointerId;
+
+        // Use the actual release position, not the last pointermove.
+        if (event && event.type === "pointerup") {
+            updateDraggedObject(event, false);
+        }
+
+        const obj = objects.find(item => item.id === draggingId);
+
+        if (obj) {
+            const snapped = snapToGrid(obj.x, obj.y);
+            obj.x = snapped.x;
+            obj.y = snapped.y;
+        }
+
+        // FIX: merge any objects that arrived while we were dragging
+        // (e.g. a dynamic obstacle spawned by Python) with our local
+        // drag result before we sendValue(). Otherwise the next
+        // apply_editor_changes() on the Python side would see the new
+        // obstacle missing from incoming and delete it.
+        if (pendingIncoming !== null && obj) {
+            const merged = pendingIncoming.map(item =>
+                item.id === draggingId
+                    ? { ...item, x: obj.x, y: obj.y }
+                    : item
+            );
+
+            for (const item of objects) {
+                if (!pendingIncoming.some(p => p.id === item.id)) {
+                    merged.push(item);
+                }
+            }
+
+            objects = merged;
+            pendingIncoming = null;
+        }
+
+        // Clear drag state before releasing capture because release
+        // can trigger lostpointercapture.
+        draggingId = null;
+        activePointerId = null;
+
+        try {
+            if (canvas.hasPointerCapture(pointerId)) {
+                canvas.releasePointerCapture(pointerId);
+            }
+        } catch (error) {
+            // Capture may already have been released.
+        }
+
+        statusText.textContent =
+            "Object snapped to grid. Navigation uses its centre cell.";
+
+        draw();
+        sendValue();
+    }
+
+    window.addEventListener("pointerup", stopDragging);
+    window.addEventListener("pointercancel", stopDragging);
+
+    canvas.addEventListener("lostpointercapture", event => {
+        if (
+            draggingId !== null &&
+            event.pointerId === activePointerId
+        ) {
+            // Do not use a stale pointer position after capture is lost.
+            const obj = objects.find(item => item.id === draggingId);
+
+            if (obj) {
+                const snapped = snapToGrid(obj.x, obj.y);
+                obj.x = snapped.x;
+                obj.y = snapped.y;
+            }
+
+            // FIX: same merge as stopDragging, since lostpointercapture
+            // can fire without a pointerup (e.g. tab switch).
+            if (pendingIncoming !== null && obj) {
+                const merged = pendingIncoming.map(item =>
+                    item.id === draggingId
+                        ? { ...item, x: obj.x, y: obj.y }
+                        : item
+                );
+
+                for (const item of objects) {
+                    if (!pendingIncoming.some(p => p.id === item.id)) {
+                        merged.push(item);
+                    }
+                }
+
+                objects = merged;
+                pendingIncoming = null;
+            }
+
+            draggingId = null;
+            activePointerId = null;
+
+            draw();
+            sendValue();
+        }
+    });
+
+    // --------------------------------------------------
+    // DELETE SELECTED OBJECT
+    // --------------------------------------------------
+
+    bindButton("deleteObject", () => {
+        if (!selectedId) return;
+
+        objects = objects.filter(obj => obj.id !== selectedId);
+
+        selectedId = null;
+        draggingId = null;
+        activePointerId = null;
+
+        statusText.textContent = "Selected object deleted.";
+
+        draw();
+        sendValue();
+    });
+
+    // --------------------------------------------------
+    // RESET OBJECTS
+    // --------------------------------------------------
+
+    bindButton("resetObjects", () => {
+        objects = [];
+        route = [];
+
+        selectedId = null;
+        draggingId = null;
+        activePointerId = null;
+        pendingIncoming = null;
+
+        statusText.textContent = "All objects removed.";
+
+        draw();
+        sendValue();
+    });
+
+    // --------------------------------------------------
+    // STREAMLIT RENDER HANDLER
+    // --------------------------------------------------
+
+    function handleRender(message) {
+        const data =
+            (message && message.args) ||
+            (message && message.detail && message.detail.args) ||
+            {};
+
+        backgroundData =
+            typeof data.background === "string"
+                ? data.background
+                : null;
+
+        sprites =
+            data.sprites && typeof data.sprites === "object"
+                ? data.sprites
+                : {};
+
+        route = sanitizeRoute(data.route);
+
+        const incomingObjects = sanitizeObjects(data.objects);
+
+        nextId = Math.max(
+            nextId,
+            highestId(incomingObjects) + 1
+        );
+
+        // FIX: while dragging, stash the incoming list instead of
+        // dropping it. stopDragging() / lostpointercapture() will merge
+        // it with our local drag result before sending.
+        if (draggingId === null) {
+            const incomingSerialized = serializeObjects(incomingObjects);
+
+            if (incomingSerialized !== lastSent) {
+                objects = incomingObjects;
+                lastSent = incomingSerialized;
+            }
+
+            if (
+                selectedId &&
+                !objects.some(obj => obj.id === selectedId)
+            ) {
+                selectedId = null;
+            }
+
+            pendingIncoming = null;
+        } else {
+            pendingIncoming = incomingObjects;
+        }
+
+        draw();
+        setFrameHeight();
+    }
+
+    // --------------------------------------------------
+    // STREAMLIT MESSAGE LISTENERS
+    // --------------------------------------------------
+
+    window.addEventListener("message", event => {
+        const message = event.data;
+
+        if (!message || typeof message !== "object") return;
+
+        if (
+            message.type === "streamlit:render" &&
+            message.isStreamlitMessage !== false
+        ) {
+            handleRender(message);
+        }
+    });
+
+    window.addEventListener("resize", setFrameHeight);
+
+    // --------------------------------------------------
+    // INITIALIZE COMPONENT
+    // --------------------------------------------------
+
+    draw();
+
+    window.parent.postMessage({
+        isStreamlitMessage: true,
+        type: "streamlit:componentReady",
+        apiVersion: 1
+    }, "*");
+
+    setFrameHeight();
+
+})();
+</script>
+
+</body>
+</html>
