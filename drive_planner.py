@@ -1,4 +1,4 @@
-"""Ollama-based high-level decision maker for EdgeMind driving."""
+"""Ollama-based constraint extractor for EdgeMind driving."""
 # drive_planner.py
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from vlmplan.drive_world import DrivingWorld
 
 
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5vl:7b"
+DEFAULT_MODEL = "qwen2.5vl:7b"   # switch to "qwen2.5vl:3b" if too slow on CPU
 
 
 # =========================================================
@@ -24,7 +24,7 @@ DRIVING_KEYWORDS = {
     "drive", "driving", "navigate", "navigation", "go", "head",
     "park", "parking", "zone", "destination", "route", "road",
     "car", "vehicle", "travel", "reach", "arrive", "steer",
-    "turn", "return", "leave", "move", "steer", "wheel",
+    "turn", "return", "leave", "move", "wheel",
 }
 
 MANIPULATION_VERBS = {
@@ -34,14 +34,27 @@ MANIPULATION_VERBS = {
     "cut", "chop", "write", "draw", "paint", "type", "email",
     "message", "call", "buy", "sell", "order", "book", "open",
     "close", "flip", "press", "tap", "throw", "catch", "roll",
-    "juggle", "spread", "mix", "stir", "blend", "chop", "peel",
-    "assemble", "disassemble", "attach", "detach", "wire",
+    "juggle", "spread", "mix", "stir", "blend", "peel",
+    "disassemble", "attach", "detach", "wire",
     "screw", "tighten", "loosen", "hammer", "nail", "saw",
 }
 
+_MULTI_WORD_NEGATIONS = ("do not", "don't", "dont")
+_SINGLE_WORD_NEGATIONS = {"not", "never", "avoid", "skip", "without", "no"}
+
+
+def _has_negation(lowered: str, words: set[str]) -> bool:
+    for phrase in _MULTI_WORD_NEGATIONS:
+        if phrase in lowered:
+            return True
+    return bool(words & _SINGLE_WORD_NEGATIONS)
+
 
 def is_likely_driving_instruction(text: str) -> tuple[bool, str]:
-    words = set(re.findall(r"[a-z]+", text.lower()))
+    normalized = text.replace("\u2019", "'").replace("\u2018", "'")
+    lowered = normalized.lower()
+    words = set(re.findall(r"[a-z]+", lowered))
+
     has_driving = bool(words & DRIVING_KEYWORDS)
     has_manip = bool(words & MANIPULATION_VERBS)
 
@@ -55,6 +68,14 @@ def is_likely_driving_instruction(text: str) -> tuple[bool, str]:
             f"'navigate to the nearest parking zone'."
         )
 
+    has_destination_token = bool(words & {"a", "b", "c", "zone", "parking"})
+    if _has_negation(lowered, words) and not has_destination_token:
+        return False, (
+            "The instruction negates driving without naming a "
+            "destination. Please tell EdgeMind where to drive "
+            "(e.g. 'drive to parking B')."
+        )
+
     return True, ""
 
 
@@ -63,59 +84,105 @@ def is_likely_driving_instruction(text: str) -> tuple[bool, str]:
 # =========================================================
 
 PROMPT = """
-You are the mission planner for a simulated autonomous CAR.
+You are the constraint-extraction tier for an autonomous car.
 
-Your ONLY job is to interpret DRIVING instructions that send the car
-to a parking zone. You are NOT a manipulation robot, NOT a cooking
-assistant, NOT a general-purpose chatbot.
+You do NOT plan routes and you do NOT control the car. A separate A*
+planner consumes your output. Your ONLY job is to translate the user's
+natural-language instruction into a structured mission spec.
 
-Valid destinations (from the scene): parking_A, parking_B, parking_C.
+You are also given an image of the current scene. Use it to locate
+obstacles and parking zones visually. If the image and the text summary
+disagree, trust the text summary (it comes from the ground-truth world).
 
-If the user's instruction is about ANYTHING other than driving the car
-to a parking zone - manipulation, cooking, general questions, any
-unrelated task - return decision "clarify".
-
-If the instruction is a valid driving instruction but does NOT name a
-specific zone (e.g. "drive to the selected zone"), use the car's
-CURRENT destination shown in the scene.
-
-CRITICAL RULE: If the instruction mentions avoiding, dodging, or staying away from specific objects, you MUST list them in "avoid_obstacle_types". Valid types are "cone" and "barrier". If the instruction does not mention avoiding anything, leave it as an empty list [].
-
-Return valid JSON only, using this exact schema.
+OUTPUT SCHEMA — return strict JSON, no prose outside the braces:
 
 {
   "decision": "<navigate|wait|stop|clarify>",
   "destination": "<parking_A|parking_B|parking_C|null>",
-  "avoid_obstacle_types": [],
-  "reason": "<one short sentence>"
+  "safety_vs_time": <float 0.0-1.0>,
+  "avoid_obstacles": [
+    {
+      "position": [<int x>, <int y>],
+      "kind": "<cone|barrier>",
+      "weight": <float 0.0-50.0>,
+      "reason": "<one short clause>"
+    }
+  ],
+  "reasoning": "<2-3 sentences explaining the weights you chose>",
+  "reason": "<one sentence: overall decision>"
 }
 
-Examples of CORRECT behaviour:
+WEIGHT INTERPRETATION — this is the whole point, read carefully:
+
+  "avoid cones"                            -> weight ≈ 5.0 per cone
+  "stay far away from cones"               -> weight ≈ 12.0 per cone
+  "strictly avoid / at all costs"          -> weight ≈ 40.0
+  "prefer to avoid"                        -> weight ≈ 2.0
+  "avoid if it's free / doesn't cost much" -> weight ≈ 1.5
+  "ignore the cones / don't care"          -> weight = 0.0
+
+CRITICAL: two cones on the same map MUST receive DIFFERENT weights if
+they are in different strategic positions. Example:
+
+  cone at (8,10) blocks the direct corridor -> weight ≈ 15.0
+  cone at (14,10) is tucked near the wall  -> weight ≈ 2.0
+
+Explain WHY in "reasoning". If the instruction does not tell you to
+distinguish obstacles, use the SAME weight for all obstacles of that kind.
+
+SAFETY_VS_TIME — a global knob the A* planner multiplies the weights by:
+
+  "drive carefully / be safe"              -> 0.85
+  neutral                                   -> 0.50
+  "get there fast / as quick as possible"  -> 0.25
+
+REFUSAL: if the instruction is not about driving to a parking zone
+(manipulation, cooking, chat), return "clarify" with all other fields
+empty (avoid_obstacles: [], safety_vs_time: 0.5).
+
+EXAMPLES:
 
   Instruction: "drive to parking A"
   Output: {"decision":"navigate","destination":"parking_A",
-           "avoid_obstacle_types":[],"reason":"Clear driving request."}
+           "safety_vs_time":0.5,"avoid_obstacles":[],
+           "reasoning":"No avoidance requested; neutral safety.",
+           "reason":"Clear driving request."}
 
-  Instruction: "go to B, stay away from cones"
+  Instruction: "go to B, stay far away from the cones"
   Output: {"decision":"navigate","destination":"parking_B",
-           "avoid_obstacle_types":["cone"],
+           "safety_vs_time":0.8,
+           "avoid_obstacles":[
+             {"position":[8,10],"kind":"cone","weight":15.0,
+              "reason":"blocks direct row-10 corridor"},
+             {"position":[14,10],"kind":"cone","weight":3.0,
+              "reason":"near wall, small detour suffices"}],
+           "reasoning":"Car travels east on row 10. The first cone
+             forces a large detour so I weight it heavily. The second
+             is tucked near the wall so tolerating its halo is cheap.",
            "reason":"Driving request with cone avoidance."}
+
+  Instruction: "drive to B, avoid cones if it doesn't cost extra"
+  Output: {"decision":"navigate","destination":"parking_B",
+           "safety_vs_time":0.3,
+           "avoid_obstacles":[
+             {"position":[8,10],"kind":"cone","weight":1.5,
+              "reason":"low cost — only avoid if free"},
+             {"position":[14,10],"kind":"cone","weight":1.5,
+              "reason":"low cost — only avoid if free"}],
+           "reasoning":"User allows cone exposure when avoiding is
+             costly; low weights let A* choose the direct route.",
+           "reason":"Driving request with soft avoidance."}
 
   Instruction: "put apples in basket"
   Output: {"decision":"clarify","destination":null,
-           "avoid_obstacle_types":[],
-           "reason":"Manipulation task - not a driving instruction."}
-
-Now interpret the user's actual instruction below.
+           "safety_vs_time":0.5,"avoid_obstacles":[],
+           "reasoning":"Not a driving task.","reason":"Manipulation."}
 
 USER INSTRUCTION:
 <<INSTRUCTION>>
 
 CURRENT ENVIRONMENT:
 <<SCENE>>
-
-ROUTE AVAILABLE:
-<<ROUTE>>
 """
 
 
@@ -139,6 +206,8 @@ Possible decisions: navigate, wait, stop, clarify.
 Rules:
 - WAIT is the correct answer when detour_cost > 10 or detour_cost = -1.
 - STOP only when the scene clearly shows danger.
+- Do NOT return avoid_obstacles or safety_vs_time; the original
+  instruction's constraint field is preserved across replans.
 
 Return valid JSON only:
 
@@ -163,7 +232,18 @@ class DriveDecision:
     decision: str
     destination: str | None
     reason: str
-    avoid_obstacle_types: list[str] = field(default_factory=list)
+    # ``None`` means "field was not returned by the LLM" (e.g. replan
+    # decisions, which deliberately do not re-extract constraints).
+    # Callers MUST distinguish None (leave existing constraints alone)
+    # from an explicit empty list (obstacle avoidance explicitly cleared).
+    avoid_obstacles: list[dict] | None = None
+    safety_vs_time: float | None = None
+    reasoning: str = ""
+
+    @property
+    def avoid_obstacle_types(self) -> list[str]:
+        """Backward-compat: distinct obstacle kinds requested."""
+        return sorted({o["kind"] for o in (self.avoid_obstacles or [])})
 
 
 class OllamaUnavailable(RuntimeError):
@@ -184,7 +264,7 @@ class OllamaDrivePlanner:
         self,
         model: str = DEFAULT_MODEL,
         url: str = OLLAMA_URL,
-        timeout: float = 60.0,
+        timeout: float = 300.0,     # was 90 — a 7B VLM on CPU needs headroom
     ):
         self.model = model
         self.url = url.rstrip("/")
@@ -210,13 +290,25 @@ class OllamaDrivePlanner:
         except Exception as error:
             return (False, f"Ollama is unavailable: {error}")
 
-    def _chat(
-        self,
-        prompt: str,
-        image_data_uri: str | None = None,
-    ) -> str:
-        message: dict = {"role": "user", "content": prompt}
+    def _scene_summary(self, world: DrivingWorld) -> str:
+        car = world.car
+        obstacles = [
+            f"{o.kind}@({o.x},{o.y})" for o in world.active_obstacles()
+        ]
+        zones = ", ".join(
+            f"{name}=({xy[0]},{xy[1]})"
+            for name, xy in world.parking_zones.items()
+        )
+        return (
+            f"Car at ({car.position[0]},{car.position[1]}) "
+            f"facing {car.direction}. "
+            f"Current destination {car.destination}. "
+            f"Parking zones: {zones}. "
+            f"Obstacles: {obstacles or 'none'}."
+        )
 
+    def _chat(self, prompt: str, image_data_uri: str | None = None) -> str:
+        message: dict = {"role": "user", "content": prompt}
         if image_data_uri:
             image_b64 = _strip_data_uri_prefix(image_data_uri)
             if image_b64:
@@ -224,28 +316,24 @@ class OllamaDrivePlanner:
 
         payload = {
             "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are EdgeMind's mission planner. You only "
-                        "interpret DRIVING instructions. Refuse off-topic "
-                        "requests with decision='clarify'. If an image is "
-                        "provided, read the scene from it; do not "
-                        "hallucinate obstacles."
-                    ),
-                },
-                message,
-            ],
+            "messages": [message],
             "stream": False,
-            "format": "json",
-            "options": {"temperature": 0, "num_predict": 250},
+            # IMPORTANT: intentionally NO "format": "json".
+            # On multiple Ollama versions this flag causes vision
+            # models to hang or silently ignore the image. We parse
+            # the JSON ourselves in _parse_decision().
+            "options": {
+                "num_predict": 768,     # cap generation — kills runaway hangs
+                "temperature": 0.1,     # deterministic JSON
+            },
+            "keep_alive": "10m",        # keep model warm between calls
         }
 
         request = urllib.request.Request(
             self.url + "/api/chat",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
+            method="POST",
         )
 
         try:
@@ -253,148 +341,151 @@ class OllamaDrivePlanner:
                 request, timeout=self.timeout
             ) as response:
                 data = json.load(response)
-            return data["message"]["content"]
-        except (
-            urllib.error.URLError,
-            TimeoutError,
-            ConnectionError,
-        ) as error:
+        except TimeoutError as error:
             raise OllamaUnavailable(
-                f"Could not communicate with Ollama: {error}"
+                f"Ollama timed out after {self.timeout:.0f}s. "
+                f"The model ({self.model}) may be too large for your "
+                f"machine. Try `ollama pull qwen2.5vl:3b` and set "
+                f"DEFAULT_MODEL accordingly."
+            ) from error
+        except urllib.error.URLError as error:
+            raise OllamaUnavailable(
+                f"Ollama request failed: {error}. "
+                f"Check that `ollama serve` is running."
+            ) from error
+        except json.JSONDecodeError as error:
+            raise OllamaUnavailable(
+                f"Ollama returned a non-JSON HTTP body: {error}"
             ) from error
 
-    @staticmethod
-    def _parse(raw: str) -> dict:
+        content = data.get("message", {}).get("content", "")
+        if not content:
+            raise OllamaUnavailable(
+                "Ollama returned an empty response. This usually means "
+                "the model crashed while processing the image. Try a "
+                "smaller image (max_dim=400), or a smaller model."
+            )
+        return content
+
+    def _parse_decision(self, raw: str) -> DriveDecision:
+        text = raw.strip()
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m:
+            text = m.group(0)
         try:
-            data = json.loads(raw)
+            data = json.loads(text)
         except json.JSONDecodeError:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start == -1 or end == -1:
-                raise ValueError("Model did not return valid JSON.")
-            data = json.loads(raw[start:end + 1])
-        if not isinstance(data, dict):
-            raise ValueError("Model response must be a JSON object.")
-        return data
+            return DriveDecision(
+                decision="clarify", destination=None,
+                reason="LLM returned invalid JSON.",
+            )
+
+        decision = str(data.get("decision", "clarify")).lower()
+        if decision not in {"navigate", "wait", "stop", "clarify"}:
+            decision = "clarify"
+
+        dest = data.get("destination")
+        if dest in (None, "null", "", "None"):
+            dest = None
+
+        # Distinguish "field absent from response" (None) from
+        # "explicitly provided" (parsed value, possibly empty).
+        # REPLAN_PROMPT deliberately omits these fields so that
+        # DriveAgent._apply_navigate_decision preserves the constraints
+        # extracted from the original user instruction across replans.
+        safety: float | None = None
+        if "safety_vs_time" in data and data["safety_vs_time"] is not None:
+            try:
+                safety = max(0.0, min(1.0, float(data["safety_vs_time"])))
+            except (TypeError, ValueError):
+                safety = None
+
+        avoid: list[dict] | None = None
+        if "avoid_obstacles" in data:
+            parsed: list[dict] = []
+            for item in (data.get("avoid_obstacles") or []):
+                if not isinstance(item, dict):
+                    continue
+                pos = item.get("position")
+                kind = item.get("kind")
+                if not (
+                    isinstance(pos, list) and len(pos) == 2
+                    and kind in ("cone", "barrier")
+                ):
+                    continue
+                try:
+                    px, py = int(pos[0]), int(pos[1])
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    weight = float(item.get("weight", 5.0))
+                except (TypeError, ValueError):
+                    weight = 5.0
+                weight = max(0.0, min(50.0, weight))
+                parsed.append({
+                    "position": [px, py],
+                    "kind": kind,
+                    "weight": weight,
+                    "reason": str(item.get("reason", "")),
+                })
+            avoid = parsed
+
+        return DriveDecision(
+            decision=decision,
+            destination=dest,
+            reason=str(data.get("reason", "")) or "No reason provided.",
+            avoid_obstacles=avoid,
+            safety_vs_time=safety,
+            reasoning=str(data.get("reasoning", "")),
+        )
 
     def decide(
         self,
         instruction: str,
         world: DrivingWorld,
-        route_available: bool,
+        route_available: bool = True,
         image_data_uri: str | None = None,
     ) -> DriveDecision:
-        scene = world.describe()
-
-        prompt = (
-            PROMPT
-            .replace("<<INSTRUCTION>>", instruction)
-            .replace("<<SCENE>>", scene)
-            .replace("<<ROUTE>>", "YES" if route_available else "NO")
-        )
-
         self.stats["calls"] += 1
-
+        prompt = PROMPT.replace("<<INSTRUCTION>>", instruction).replace(
+            "<<SCENE>>", self._scene_summary(world)
+        )
         try:
             raw = self._chat(prompt, image_data_uri=image_data_uri)
-            result = self._parse(raw)
-
-            decision = str(result.get("decision", "clarify")).lower()
-            destination = result.get("destination")
-            reason = str(result.get("reason", "No explanation provided."))
-            avoid = result.get("avoid_obstacle_types", [])
-
-            if not isinstance(avoid, list):
-                avoid = []
-            avoid = [
-                str(t).lower() for t in avoid
-                if str(t).lower() in ("cone", "barrier")
-            ]
-
-            # --- DETERMINISTIC SAFETY NET ---
-            # If the VLM missed a constraint that is explicitly in the text,
-            # we force it here. This guarantees the simulation never breaks.
-            text_lower = instruction.lower()
-            if "cone" in text_lower and "cone" not in avoid:
-                avoid.append("cone")
-            if "barrier" in text_lower and "barrier" not in avoid:
-                avoid.append("barrier")
-
-            allowed = {"navigate", "wait", "stop", "clarify"}
-            if decision not in allowed:
-                decision = "clarify"
-
-            if destination is not None:
-                destination = str(destination)
-
-            if (
-                destination is not None
-                and destination not in world.parking_zones
-            ):
-                decision = "clarify"
-                destination = None
-                reason = "The proposed destination does not exist."
-
-            if decision == "navigate" and not route_available:
-                decision = "stop"
-                reason = (
-                    "The model proposed navigation, but A* "
-                    "could not find a valid route."
-                )
-
-            if decision == "navigate" and destination is None:
-                decision = "clarify"
-                reason = "No valid destination was selected."
-
-            self.stats[decision] += 1
-
-            return DriveDecision(
-                decision=decision,
-                destination=destination,
-                reason=reason,
-                avoid_obstacle_types=avoid,
-            )
-
-        except Exception:
+        except OllamaUnavailable:
             self.stats["errors"] += 1
             raise
+        except Exception as error:
+            self.stats["errors"] += 1
+            raise OllamaUnavailable(str(error)) from error
+
+        decision = self._parse_decision(raw)
+        self.stats[decision.decision] = self.stats.get(decision.decision, 0) + 1
+        return decision
 
     def decide_replan(
         self,
         reason: str,
         world: DrivingWorld,
-        detour_cost: int = 0,
+        detour_cost: int,
         image_data_uri: str | None = None,
     ) -> DriveDecision:
-        scene = world.describe()
-
+        self.stats["calls"] += 1
         prompt = (
             REPLAN_PROMPT
-            .replace("<<CHANGES>>", reason or "environment updated")
+            .replace("<<CHANGES>>", reason)
             .replace("<<DETOUR_COST>>", str(detour_cost))
-            .replace("<<SCENE>>", scene)
+            .replace("<<SCENE>>", self._scene_summary(world))
         )
-
-        self.stats["calls"] += 1
-
         try:
             raw = self._chat(prompt, image_data_uri=image_data_uri)
-            result = self._parse(raw)
-
-            decision = str(result.get("decision", "navigate")).lower()
-            reason_text = str(result.get("reason", ""))
-
-            if decision not in {"navigate", "wait", "stop", "clarify"}:
-                decision = "navigate"
-
-            self.stats[decision] += 1
-
-            return DriveDecision(
-                decision=decision,
-                destination=None,
-                reason=reason_text,
-            )
-
-        except Exception:
+        except OllamaUnavailable:
             self.stats["errors"] += 1
             raise
+        except Exception as error:
+            self.stats["errors"] += 1
+            raise OllamaUnavailable(str(error)) from error
+
+        decision = self._parse_decision(raw)
+        self.stats[decision.decision] = self.stats.get(decision.decision, 0) + 1
+        return decision

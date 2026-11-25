@@ -1,80 +1,40 @@
-## index.html             
+<!--index.html--->
 <!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <style>
     * { box-sizing: border-box; }
-
     body {
-        margin: 0;
-        padding: 10px;
-        background: #111827;
-        color: white;
-        font-family: Arial, sans-serif;
-        user-select: none;
-        overflow: hidden;
+        margin: 0; padding: 10px; background: #111827; color: white;
+        font-family: Arial, sans-serif; user-select: none; overflow: hidden;
     }
-
-    .toolbar {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        margin-bottom: 10px;
-        align-items: center;
-    }
-
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; align-items: center; }
     button {
-        border: 0;
-        border-radius: 6px;
-        padding: 9px 13px;
-        background: #374151;
-        color: white;
-        cursor: pointer;
-        font-weight: 600;
+        border: 0; border-radius: 6px; padding: 9px 13px; background: #374151;
+        color: white; cursor: pointer; font-weight: 600;
     }
-
     button:hover { background: #4b5563; }
     button.primary { background: #2563eb; }
     button.danger { background: #991b1b; }
+    button.warn { background: #b45309; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
-
-    #status {
-        color: #cbd5e1;
-        font-size: 12px;
-        margin-left: auto;
-    }
-
+    #status { color: #cbd5e1; font-size: 12px; margin-left: auto; }
     .canvas-wrap {
-        width: 100%;
-        overflow: hidden;
-        border: 1px solid #475569;
-        border-radius: 8px;
-        background: #1f2937;
+        width: 100%; overflow: hidden; border: 1px solid #475569;
+        border-radius: 8px; background: #1f2937;
     }
-
-    canvas {
-        display: block;
-        width: 100%;
-        height: auto;
-        touch-action: none;
-        cursor: crosshair;
-    }
-
-    .help {
-        margin-top: 8px;
-        color: #9ca3af;
-        font-size: 12px;
-    }
+    canvas { display: block; width: 100%; height: auto; touch-action: none; cursor: crosshair; }
+    .help { margin-top: 8px; color: #9ca3af; font-size: 12px; }
 </style>
 </head>
-
 <body>
 
 <div class="toolbar">
     <button class="primary" id="addCar">+ Add car</button>
     <button id="addCone">+ Add cone</button>
     <button id="addBarrier">+ Add barrier</button>
+    <button class="warn" id="addOpposition">+ Add opposition car</button>
     <button class="danger" id="deleteObject">Delete selected</button>
     <button id="resetObjects">Reset objects</button>
     <span id="status">Select an object to move it.</span>
@@ -87,26 +47,20 @@
 <div class="help">
     Drag objects to move them. Objects snap to the nearest grid cell when released.
     Navigation uses the grid cell containing each object's centre.
-    Select an object and use Delete selected to remove it.
 </div>
 
 <script>
 (() => {
     "use strict";
 
-    // --------------------------------------------------
-    // CONFIGURATION
-    // --------------------------------------------------
-
     const GRID = 20;
     const WIDTH = 900;
     const HEIGHT = 600;
-
     const CELL_W = WIDTH / GRID;
     const CELL_H = HEIGHT / GRID;
-
     const DEFAULT_SIZE = 55;
     const SPAWN_DISTANCE = 42;
+    const DEFAULT_FALLOUT = 1;
 
     const canvas = document.getElementById("worldCanvas");
     const ctx = canvas.getContext("2d");
@@ -114,6 +68,10 @@
 
     let objects = [];
     let route = [];
+    let ghostRoute = [];
+    let softAvoidCells = [];
+    let hazardCells = [];
+    let carState = "idle";
 
     let backgroundData = null;
     let sprites = {};
@@ -121,51 +79,27 @@
     let selectedId = null;
     let draggingId = null;
     let activePointerId = null;
-
     let dragOffsetX = 0;
     let dragOffsetY = 0;
 
     let nextId = 1;
     let lastSent = "";
-
-    // FIX: hold objects Python sent while we were dragging so a dynamic
-    // obstacle spawned mid-drag isn't deleted on release.
     let pendingIncoming = null;
-
     const imageCache = {};
-
-    // --------------------------------------------------
-    // IMAGE LOADING
-    // --------------------------------------------------
 
     function getImage(source) {
         if (!source || typeof source !== "string") return null;
-
         if (!imageCache[source]) {
             const image = new Image();
             image.src = source;
             imageCache[source] = image;
-
-            image.onload = () => {
-                draw();
-                setFrameHeight();
-            };
+            image.onload = () => { draw(); setFrameHeight(); };
         }
-
         const image = imageCache[source];
-
-        return image.complete && image.naturalWidth > 0
-            ? image
-            : null;
+        return image.complete && image.naturalWidth > 0 ? image : null;
     }
 
-    function getSprite(type) {
-        return getImage(sprites[type]);
-    }
-
-    // --------------------------------------------------
-    // COMPONENT COMMUNICATION
-    // --------------------------------------------------
+    function getSprite(type) { return getImage(sprites[type]); }
 
     function serializeObjects(list) {
         return JSON.stringify(
@@ -174,252 +108,121 @@
                 type: obj.type,
                 x: obj.x,
                 y: obj.y,
-                size: obj.size
+                size: obj.size,
+                fallout: Number.isFinite(Number(obj.fallout)) && Number(obj.fallout) > 0
+                    ? Number(obj.fallout) : DEFAULT_FALLOUT
             }))
         );
     }
 
     function sendValue() {
         const serialized = serializeObjects(objects);
-
         if (serialized === lastSent) return;
-
         lastSent = serialized;
-
         window.parent.postMessage({
             isStreamlitMessage: true,
             type: "streamlit:setComponentValue",
             value: objects.map(obj => ({
-                id: obj.id,
-                type: obj.type,
-                x: obj.x,
-                y: obj.y,
-                size: obj.size
+                id: obj.id, type: obj.type, x: obj.x, y: obj.y, size: obj.size,
+                fallout: Number.isFinite(Number(obj.fallout)) && Number(obj.fallout) > 0
+                    ? Number(obj.fallout) : DEFAULT_FALLOUT
             }))
         }, "*");
     }
 
     function setFrameHeight() {
-        const height = Math.max(
-            document.body.scrollHeight,
-            document.documentElement.scrollHeight
-        );
-
+        const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
         window.parent.postMessage({
-            isStreamlitMessage: true,
-            type: "streamlit:setFrameHeight",
-            height: height
+            isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: height
         }, "*");
     }
 
-    // --------------------------------------------------
-    // GRID HELPERS
-    // --------------------------------------------------
-
-    function clamp(value, min, max) {
-        return Math.max(min, Math.min(max, value));
-    }
+    function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 
     function pixelToGrid(x, y) {
-        return {
-            x: clamp(Math.floor(x / CELL_W), 0, GRID - 1),
-            y: clamp(Math.floor(y / CELL_H), 0, GRID - 1)
-        };
+        return { x: clamp(Math.floor(x / CELL_W), 0, GRID - 1), y: clamp(Math.floor(y / CELL_H), 0, GRID - 1) };
     }
 
     function snapToGrid(x, y) {
         const cell = pixelToGrid(x, y);
-
-        return {
-            x: cell.x * CELL_W + CELL_W / 2,
-            y: cell.y * CELL_H + CELL_H / 2
-        };
+        return { x: cell.x * CELL_W + CELL_W / 2, y: cell.y * CELL_H + CELL_H / 2 };
     }
-
-    // --------------------------------------------------
-    // POINTER POSITION
-    // --------------------------------------------------
 
     function pointerPosition(event) {
         const rect = canvas.getBoundingClientRect();
-
         const scaleX = WIDTH / rect.width;
         const scaleY = HEIGHT / rect.height;
-
-        return {
-            x: (event.clientX - rect.left) * scaleX,
-            y: (event.clientY - rect.top) * scaleY
-        };
+        return { x: (event.clientX - rect.left) * scaleX, y: (event.clientY - rect.top) * scaleY };
     }
-
-    // --------------------------------------------------
-    // INCOMING DATA SANITIZING
-    // --------------------------------------------------
 
     function sanitizeObjects(list) {
         if (!Array.isArray(list)) return [];
-
         return list
             .filter(obj => obj && typeof obj === "object")
             .map((obj, index) => {
-                const x = Number(obj.x);
-                const y = Number(obj.y);
-                const size = Number(obj.size);
-
+                const x = Number(obj.x), y = Number(obj.y), size = Number(obj.size), fallout = Number(obj.fallout);
                 return {
-                    id: (obj.id !== null && obj.id !== undefined && obj.id !== "")
-                        ? String(obj.id)
-                        : "object_auto_" + (index + 1),
-
-                    type: (typeof obj.type === "string" && obj.type)
-                        ? obj.type
-                        : "car",
-
-                    x: clamp(
-                        Number.isFinite(x) ? x : WIDTH / 2,
-                        CELL_W / 2,
-                        WIDTH - CELL_W / 2
-                    ),
-
-                    y: clamp(
-                        Number.isFinite(y) ? y : HEIGHT / 2,
-                        CELL_H / 2,
-                        HEIGHT - CELL_H / 2
-                    ),
-
-                    size: (Number.isFinite(size) && size > 0)
-                        ? size
-                        : DEFAULT_SIZE
+                    id: (obj.id !== null && obj.id !== undefined && obj.id !== "") ? String(obj.id) : "object_auto_" + (index + 1),
+                    type: (typeof obj.type === "string" && obj.type) ? obj.type : "car",
+                    x: clamp(Number.isFinite(x) ? x : WIDTH / 2, CELL_W / 2, WIDTH - CELL_W / 2),
+                    y: clamp(Number.isFinite(y) ? y : HEIGHT / 2, CELL_H / 2, HEIGHT - CELL_H / 2),
+                    size: (Number.isFinite(size) && size > 0) ? size : DEFAULT_SIZE,
+                    fallout: (Number.isFinite(fallout) && fallout > 0) ? fallout : DEFAULT_FALLOUT
                 };
             });
     }
 
     function sanitizeRoute(list) {
         if (!Array.isArray(list)) return [];
-
         return list
             .filter(point => Array.isArray(point) && point.length >= 2)
             .map(point => [Number(point[0]), Number(point[1])])
-            .filter(point =>
-                Number.isFinite(point[0]) &&
-                Number.isFinite(point[1])
-            );
+            .filter(point => Number.isFinite(point[0]) && Number.isFinite(point[1]));
     }
 
     function highestId(list) {
         return list.reduce((max, obj) => {
             const match = String(obj.id).match(/\d+/g);
-
             if (!match) return max;
-
             const value = parseInt(match[match.length - 1], 10);
-
-            return Number.isFinite(value)
-                ? Math.max(max, value)
-                : max;
+            return Number.isFinite(value) ? Math.max(max, value) : max;
         }, 0);
     }
 
-    // --------------------------------------------------
-    // UNIQUE SPAWN POSITIONS
-    // --------------------------------------------------
-
     function findSpawnPosition() {
         const candidates = [];
-
-        // Search cells in a spread-out pattern.
         for (let row = 1; row < GRID - 1; row += 2) {
             for (let col = 1; col < GRID - 1; col += 2) {
-                candidates.push({
-                    x: col * CELL_W + CELL_W / 2,
-                    y: row * CELL_H + CELL_H / 2
-                });
+                candidates.push({ x: col * CELL_W + CELL_W / 2, y: row * CELL_H + CELL_H / 2 });
             }
         }
-
-        // Prefer positions far from existing objects.
         for (const candidate of candidates) {
             const occupied = objects.some(obj => {
-                return Math.hypot(
-                    obj.x - candidate.x,
-                    obj.y - candidate.y
-                ) < SPAWN_DISTANCE;
+                return Math.hypot(obj.x - candidate.x, obj.y - candidate.y) < SPAWN_DISTANCE;
             });
-
             if (!occupied) return candidate;
         }
-
-        // Fallback: check every cell.
-        for (let row = 0; row < GRID; row++) {
-            for (let col = 0; col < GRID; col++) {
-                const candidate = {
-                    x: col * CELL_W + CELL_W / 2,
-                    y: row * CELL_H + CELL_H / 2
-                };
-
-                const occupied = objects.some(obj => {
-                    return Math.hypot(
-                        obj.x - candidate.x,
-                        obj.y - candidate.y
-                    ) < SPAWN_DISTANCE;
-                });
-
-                if (!occupied) return candidate;
-            }
-        }
-
-        return {
-            x: CELL_W / 2,
-            y: CELL_H / 2
-        };
+        return { x: CELL_W / 2, y: CELL_H / 2 };
     }
-
-    // --------------------------------------------------
-    // DRAW BACKGROUND
-    // --------------------------------------------------
 
     function drawBackground() {
         ctx.fillStyle = "#e5e7eb";
         ctx.fillRect(0, 0, WIDTH, HEIGHT);
-
         const image = getImage(backgroundData);
-
-        if (image) {
-            ctx.drawImage(image, 0, 0, WIDTH, HEIGHT);
-        }
+        if (image) ctx.drawImage(image, 0, 0, WIDTH, HEIGHT);
     }
-
-    // --------------------------------------------------
-    // DRAW GRID
-    // --------------------------------------------------
 
     function drawGrid() {
         ctx.save();
-
         ctx.strokeStyle = "rgba(30, 41, 59, 0.35)";
         ctx.lineWidth = 1;
-
         for (let i = 0; i <= GRID; i++) {
-            const x = i * CELL_W;
-            const y = i * CELL_H;
-
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, HEIGHT);
-            ctx.stroke();
-
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(WIDTH, y);
-            ctx.stroke();
+            const x = i * CELL_W, y = i * CELL_H;
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, HEIGHT); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(WIDTH, y); ctx.stroke();
         }
-
         ctx.restore();
     }
-
-    // --------------------------------------------------
-    // PARKING ZONES
-    // --------------------------------------------------
 
     function drawParkingZones() {
         const zones = [
@@ -427,94 +230,186 @@
             { name: "B", x: 18, y: 10, color: "#2563eb" },
             { name: "C", x: 18, y: 17, color: "#9333ea" }
         ];
-
         zones.forEach(zone => {
-            const x = zone.x * CELL_W;
-            const y = zone.y * CELL_H;
-
-            ctx.fillStyle = zone.color;
-            ctx.globalAlpha = 0.25;
+            const x = zone.x * CELL_W, y = zone.y * CELL_H;
+            ctx.fillStyle = zone.color; ctx.globalAlpha = 0.25;
             ctx.fillRect(x, y, CELL_W, CELL_H);
             ctx.globalAlpha = 1;
-
-            ctx.strokeStyle = zone.color;
-            ctx.lineWidth = 2;
+            ctx.strokeStyle = zone.color; ctx.lineWidth = 2;
             ctx.strokeRect(x, y, CELL_W, CELL_H);
-
-            ctx.fillStyle = "#111827";
-            ctx.font = "bold 12px Arial";
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-
-            ctx.fillText(
-                "P" + zone.name,
-                x + CELL_W / 2,
-                y + CELL_H / 2
-            );
+            ctx.fillStyle = "#111827"; ctx.font = "bold 12px Arial";
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText("P" + zone.name, x + CELL_W / 2, y + CELL_H / 2);
         });
     }
 
-    // --------------------------------------------------
-    // DRAW ROUTE
-    // --------------------------------------------------
-
-    function drawRoute() {
-        if (!Array.isArray(route) || route.length === 0) return;
-
+    function drawSoftAvoidCells() {
+        if (!Array.isArray(softAvoidCells) || softAvoidCells.length === 0) return;
         ctx.save();
-
-        ctx.strokeStyle = "#f59e0b";
-        ctx.lineWidth = 5;
-        ctx.lineJoin = "round";
-        ctx.lineCap = "round";
-
-        ctx.beginPath();
-
-        route.forEach((point, index) => {
-            const x = (point[0] + 0.5) * CELL_W;
-            const y = (point[1] + 0.5) * CELL_H;
-
-            if (index === 0) {
-                ctx.moveTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
-            }
+        softAvoidCells.forEach(cell => {
+            if (!Array.isArray(cell) || cell.length < 2) return;
+            const gx = Number(cell[0]), gy = Number(cell[1]), weight = Number(cell[2]) || 1.0;
+            if (!Number.isFinite(gx) || !Number.isFinite(gy)) return;
+            if (gx < 0 || gx >= GRID || gy < 0 || gy >= GRID) return;
+            const px = gx * CELL_W, py = gy * CELL_H;
+            const alpha = Math.min(0.65, 0.12 + (weight / 20.0) * 0.5);
+            ctx.fillStyle = `rgba(220, 38, 38, ${alpha})`;
+            ctx.fillRect(px, py, CELL_W, CELL_H);
+            ctx.strokeStyle = `rgba(220, 38, 38, ${Math.min(0.95, alpha + 0.35)})`;
+            ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+            ctx.strokeRect(px + 1.5, py + 1.5, CELL_W - 3, CELL_H - 3);
+            ctx.setLineDash([]);
         });
-
-        ctx.stroke();
         ctx.restore();
     }
 
-    // --------------------------------------------------
-    // OBJECT DRAWING
-    // --------------------------------------------------
+    function drawGhostRoute() {
+        if (!Array.isArray(ghostRoute) || ghostRoute.length === 0) return;
+        ctx.save();
+
+        // Offset by 10 pixels so it runs parallel and is always visible
+        const offset = 10.0;
+
+        // Check if the ghost route goes through any soft-avoid cells
+        const crossesHazard = ghostRoute.some(p => 
+            softAvoidCells.some(c => c[0] === p[0] && c[1] === p[1])
+        );
+
+        // Red if dangerous, yellow if clean
+        const strokeColor = crossesHazard ? "#ef4444" : "#eab308";
+        const haloColor = crossesHazard ? "rgba(239, 68, 68, 0.3)" : "rgba(234, 179, 8, 0.3)";
+
+        // Wide translucent halo
+        ctx.setLineDash([]);
+        ctx.strokeStyle = haloColor;
+        ctx.lineWidth = 8;
+        ctx.lineJoin = "round"; ctx.lineCap = "round";
+
+        if (ghostRoute.length === 1) {
+            const x = (ghostRoute[0][0] + 0.5) * CELL_W - offset;
+            const y = (ghostRoute[0][1] + 0.5) * CELL_H + offset;
+            ctx.fillStyle = haloColor;
+            ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+        } else {
+            ctx.beginPath();
+            ghostRoute.forEach((point, index) => {
+                const x = (point[0] + 0.5) * CELL_W - offset;
+                const y = (point[1] + 0.5) * CELL_H + offset;
+                if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+
+        // Bright dashed line on top
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = 3.0;
+
+        if (ghostRoute.length === 1) {
+            const x = (ghostRoute[0][0] + 0.5) * CELL_W - offset;
+            const y = (ghostRoute[0][1] + 0.5) * CELL_H + offset;
+            ctx.fillStyle = strokeColor;
+            ctx.beginPath(); ctx.arc(x, y, 3, 0, 2 * Math.PI); ctx.fill();
+        } else {
+            ctx.beginPath();
+            ghostRoute.forEach((point, index) => {
+                const x = (point[0] + 0.5) * CELL_W - offset;
+                const y = (point[1] + 0.5) * CELL_H + offset;
+                if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    function drawRoute() {
+        if (!Array.isArray(route) || route.length === 0) return;
+        const crossesHazard = Array.isArray(hazardCells) && hazardCells.length > 0;
+        ctx.save();
+        ctx.strokeStyle = crossesHazard ? "#f59e0b" : "#22c55e";
+        ctx.lineWidth = 5;
+        ctx.lineJoin = "round"; ctx.lineCap = "round";
+
+        if (route.length === 1) {
+            const x = (route[0][0] + 0.5) * CELL_W;
+            const y = (route[0][1] + 0.5) * CELL_H;
+            ctx.fillStyle = crossesHazard ? "#f59e0b" : "#22c55e";
+            ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+        } else {
+            ctx.beginPath();
+            route.forEach((point, index) => {
+                const x = (point[0] + 0.5) * CELL_W, y = (point[1] + 0.5) * CELL_H;
+                if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
+    function drawHazardMarkers() {
+        if (!Array.isArray(hazardCells) || hazardCells.length === 0) return;
+        ctx.save();
+        ctx.strokeStyle = "#dc2626"; ctx.lineWidth = 2.5; ctx.lineCap = "round";
+        hazardCells.forEach(cell => {
+            if (!Array.isArray(cell) || cell.length < 2) return;
+            const gx = Number(cell[0]), gy = Number(cell[1]);
+            if (!Number.isFinite(gx) || !Number.isFinite(gy)) return;
+            const cx = (gx + 0.5) * CELL_W, cy = (gy + 0.5) * CELL_H, r = CELL_W * 0.28;
+            ctx.beginPath();
+            ctx.moveTo(cx - r, cy - r); ctx.lineTo(cx + r, cy + r);
+            ctx.moveTo(cx + r, cy - r); ctx.lineTo(cx - r, cy + r);
+            ctx.stroke();
+        });
+        ctx.restore();
+    }
+
+    function drawLegend() {
+        const hasGhost = Array.isArray(ghostRoute) && ghostRoute.length > 0;
+        const hasHalo = Array.isArray(softAvoidCells) && softAvoidCells.length > 0;
+        const hasRoute = Array.isArray(route) && route.length > 0;
+        if (!hasGhost && !hasHalo && !hasRoute) return;
+
+        const items = [];
+        if (hasRoute) {
+            const crosses = Array.isArray(hazardCells) && hazardCells.length > 0;
+            items.push({ color: crosses ? "#f59e0b" : "#22c55e", label: crosses ? "Actual route — crosses hazard" : "Actual route — clean (LLM)" });
+        }
+        if (hasGhost) {
+            const crosses = ghostRoute.some(p => softAvoidCells.some(c => c[0] === p[0] && c[1] === p[1]));
+            items.push({ color: crosses ? "#ef4444" : "#eab308", label: crosses ? "Ghost route — crosses hazard" : "Ghost route — A* alone", dash: true });
+        }
+        if (hasHalo) items.push({ color: "rgba(220, 38, 38, 0.7)", label: "Soft-avoid halo (gradient)" });
+
+        const boxW = 250, rowH = 15, padding = 10;
+        const boxH = padding * 2 + items.length * rowH;
+        const x0 = WIDTH - boxW - 12, y0 = HEIGHT - boxH - 12;
+
+        ctx.save();
+        ctx.fillStyle = "rgba(17, 24, 39, 0.85)"; ctx.fillRect(x0, y0, boxW, boxH);
+        ctx.strokeStyle = "rgba(148, 163, 184, 0.5)"; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, boxW - 1, boxH - 1);
+        ctx.font = "11px Arial"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+
+        items.forEach((item, i) => {
+            const y = y0 + padding + rowH / 2 + i * rowH;
+            const lx0 = x0 + padding, lx1 = lx0 + 28;
+            ctx.strokeStyle = item.color; ctx.lineWidth = 3;
+            if (item.dash) ctx.setLineDash([5, 4]); else ctx.setLineDash([]);
+            ctx.beginPath(); ctx.moveTo(lx0, y); ctx.lineTo(lx1, y); ctx.stroke(); ctx.setLineDash([]);
+            ctx.fillStyle = "#e5e7eb"; ctx.fillText(item.label, lx1 + 8, y);
+        });
+        ctx.restore();
+    }
 
     function objectDimensions(obj) {
         const size = Number(obj && obj.size);
-
-        const scale = clamp(
-            ((Number.isFinite(size) && size > 0)
-                ? size
-                : DEFAULT_SIZE) / DEFAULT_SIZE,
-            0.3,
-            1.5
-        );
-
-        return {
-            width: CELL_W * 0.82 * scale,
-            height: CELL_H * 0.82 * scale
-        };
+        const scale = clamp(((Number.isFinite(size) && size > 0) ? size : DEFAULT_SIZE) / DEFAULT_SIZE, 0.3, 1.5);
+        return { width: CELL_W * 0.82 * scale, height: CELL_H * 0.82 * scale };
     }
 
     function drawObject(obj) {
         const dimensions = objectDimensions(obj);
-
-        const width = dimensions.width;
-        const height = dimensions.height;
-
-        const x = obj.x - width / 2;
-        const y = obj.y - height / 2;
-
+        const width = dimensions.width, height = dimensions.height;
+        const x = obj.x - width / 2, y = obj.y - height / 2;
         const sprite = getSprite(obj.type);
 
         ctx.save();
@@ -524,471 +419,241 @@
         } else {
             const colors = {
                 car: "#2563eb",
+                traffic_car: "#10b981",
+                opposition_car: "#dc2626",
                 cone: "#f97316",
-                barrier: "#dc2626"
+                barrier: "#991b1b"
             };
-
             ctx.fillStyle = colors[obj.type] || "#64748b";
 
             if (obj.type === "car") {
                 ctx.fillRect(x, y, width, height);
-
                 ctx.fillStyle = "#bfdbfe";
-                ctx.fillRect(
-                    x + width * 0.2,
-                    y + height * 0.2,
-                    width * 0.6,
-                    height * 0.6
-                );
-
+                ctx.fillRect(x + width * 0.2, y + height * 0.2, width * 0.6, height * 0.6);
+            } else if (obj.type === "traffic_car") {
+                ctx.fillRect(x, y, width, height);
+                ctx.fillStyle = "#a7f3d0";
+                ctx.fillRect(x + width * 0.2, y + height * 0.2, width * 0.6, height * 0.6);
+            } else if (obj.type === "opposition_car") {
+                ctx.fillRect(x, y, width, height);
+                ctx.fillStyle = "#fecaca";
+                ctx.fillRect(x + width * 0.2, y + height * 0.2, width * 0.6, height * 0.6);
             } else if (obj.type === "cone") {
                 ctx.beginPath();
                 ctx.moveTo(obj.x, y);
                 ctx.lineTo(x + width, y + height);
                 ctx.lineTo(x, y + height);
-                ctx.closePath();
-                ctx.fill();
-
+                ctx.closePath(); ctx.fill();
             } else {
                 ctx.fillRect(x, y, width, height);
-
-                ctx.strokeStyle = "#ffffff";
-                ctx.lineWidth = 2;
-
-                ctx.beginPath();
-                ctx.moveTo(x + 3, y + height - 3);
-                ctx.lineTo(x + width - 3, y + 3);
-                ctx.stroke();
+                ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2;
+                ctx.beginPath(); ctx.moveTo(x + 3, y + height - 3); ctx.lineTo(x + width - 3, y + 3); ctx.stroke();
             }
         }
 
         if (obj.id === selectedId) {
-            ctx.strokeStyle = "#facc15";
-            ctx.lineWidth = 3;
+            ctx.strokeStyle = "#facc15"; ctx.lineWidth = 3;
             ctx.strokeRect(x - 3, y - 3, width + 6, height + 6);
         }
-
         ctx.restore();
     }
 
-    function drawObjects() {
-        objects.forEach(drawObject);
-    }
-
-    // --------------------------------------------------
-    // MAIN DRAW
-    // --------------------------------------------------
+    function drawObjects() { objects.forEach(drawObject); }
 
     function draw() {
         try {
             ctx.clearRect(0, 0, WIDTH, HEIGHT);
-
             drawBackground();
             drawParkingZones();
+            drawSoftAvoidCells();
             drawGrid();
             drawRoute();
+            drawGhostRoute();
+            drawHazardMarkers();
             drawObjects();
+            drawLegend();
 
+            if (carState !== "idle" && carState !== "completed" && carState !== "clarify") {
+                if ((!route || route.length === 0) && (!ghostRoute || ghostRoute.length === 0)) {
+                    ctx.save();
+                    ctx.fillStyle = "rgba(220, 38, 38, 0.85)";
+                    ctx.font = "bold 22px Arial";
+                    ctx.textAlign = "center";
+                    ctx.fillText("CAR BLOCKED — NO VALID ROUTE", WIDTH / 2, HEIGHT / 2);
+                    ctx.restore();
+                }
+            }
         } catch (error) {
             console.error("Canvas draw failed:", error);
         }
     }
 
-    // --------------------------------------------------
-    // OBJECT CREATION
-    // --------------------------------------------------
-
     function addObject(type) {
         let id;
-
-        do {
-            id = "object_" + nextId++;
-        } while (objects.some(obj => obj.id === id));
-
+        do { id = "object_" + nextId++; } while (objects.some(obj => obj.id === id));
         const position = findSpawnPosition();
-
-        const obj = {
-            id: id,
-            type: type,
-            x: position.x,
-            y: position.y,
-            size: DEFAULT_SIZE
-        };
-
-        objects.push(obj);
-        selectedId = obj.id;
-
-        statusText.textContent =
-            type.charAt(0).toUpperCase() +
-            type.slice(1) +
-            " added at a free position.";
-
-        draw();
-        sendValue();
+        objects.push({ id: id, type: type, x: position.x, y: position.y, size: DEFAULT_SIZE, fallout: DEFAULT_FALLOUT });
+        selectedId = id;
+        statusText.textContent = type.charAt(0).toUpperCase() + type.slice(1) + " added.";
+        draw(); sendValue();
     }
 
     function bindButton(id, handler) {
         const element = document.getElementById(id);
-
         if (!element) return;
-
         element.addEventListener("click", event => {
             handler();
-
-            if (event.currentTarget && event.currentTarget.blur) {
-                event.currentTarget.blur();
-            }
+            if (event.currentTarget && event.currentTarget.blur) event.currentTarget.blur();
         });
     }
 
     bindButton("addCar", () => addObject("car"));
     bindButton("addCone", () => addObject("cone"));
     bindButton("addBarrier", () => addObject("barrier"));
-
-    // --------------------------------------------------
-    // OBJECT SELECTION
-    // --------------------------------------------------
+    bindButton("addOpposition", () => addObject("opposition_car"));
 
     function findObjectAt(x, y) {
         for (let i = objects.length - 1; i >= 0; i--) {
-            const obj = objects[i];
-            const dimensions = objectDimensions(obj);
-
-            const halfWidth = dimensions.width / 2;
-            const halfHeight = dimensions.height / 2;
-
-            if (
-                Math.abs(x - obj.x) <= halfWidth + 5 &&
-                Math.abs(y - obj.y) <= halfHeight + 5
-            ) {
-                return obj;
-            }
+            const obj = objects[i], dimensions = objectDimensions(obj);
+            if (Math.abs(x - obj.x) <= dimensions.width / 2 + 5 && Math.abs(y - obj.y) <= dimensions.height / 2 + 5) return obj;
         }
-
         return null;
     }
 
-    // --------------------------------------------------
-    // DRAGGING
-    // --------------------------------------------------
-
     canvas.addEventListener("pointerdown", event => {
-        if (event.pointerType === "mouse" && event.button !== 0) {
-            return;
-        }
-
+        if (event.pointerType === "mouse" && event.button !== 0) return;
         if (draggingId !== null) return;
-
         const position = pointerPosition(event);
         const found = findObjectAt(position.x, position.y);
-
-        if (!found) {
-            selectedId = null;
-            draw();
-            return;
-        }
-
-        selectedId = found.id;
-        draggingId = found.id;
-        activePointerId = event.pointerId;
-
-        // Preserve where the object was grabbed.
-        dragOffsetX = found.x - position.x;
-        dragOffsetY = found.y - position.y;
-
-        try {
-            canvas.setPointerCapture(event.pointerId);
-        } catch (error) {
-            console.warn("Pointer capture unavailable:", error);
-        }
-
+        if (!found) { selectedId = null; draw(); return; }
+        selectedId = found.id; draggingId = found.id; activePointerId = event.pointerId;
+        dragOffsetX = found.x - position.x; dragOffsetY = found.y - position.y;
+        try { canvas.setPointerCapture(event.pointerId); } catch (error) {}
         statusText.textContent = "Moving " + found.type + "...";
-
-        draw();
-        event.preventDefault();
+        draw(); event.preventDefault();
     });
 
     function updateDraggedObject(event, snap = false) {
-        if (
-            draggingId === null ||
-            activePointerId === null ||
-            event.pointerId !== activePointerId
-        ) {
-            return;
-        }
-
+        if (draggingId === null || activePointerId === null || event.pointerId !== activePointerId) return;
         const obj = objects.find(item => item.id === draggingId);
         if (!obj) return;
-
         const position = pointerPosition(event);
-
-        const rawX = clamp(
-            position.x + dragOffsetX,
-            CELL_W / 2,
-            WIDTH - CELL_W / 2
-        );
-
-        const rawY = clamp(
-            position.y + dragOffsetY,
-            CELL_H / 2,
-            HEIGHT - CELL_H / 2
-        );
-
+        const rawX = clamp(position.x + dragOffsetX, CELL_W / 2, WIDTH - CELL_W / 2);
+        const rawY = clamp(position.y + dragOffsetY, CELL_H / 2, HEIGHT - CELL_H / 2);
         if (snap) {
             const snapped = snapToGrid(rawX, rawY);
-            obj.x = snapped.x;
-            obj.y = snapped.y;
-        } else {
-            obj.x = rawX;
-            obj.y = rawY;
-        }
-
+            obj.x = snapped.x; obj.y = snapped.y;
+        } else { obj.x = rawX; obj.y = rawY; }
         draw();
     }
 
     window.addEventListener("pointermove", event => {
         if (draggingId === null) return;
-
-        updateDraggedObject(event, false);
-        event.preventDefault();
-
+        updateDraggedObject(event, false); event.preventDefault();
     }, { passive: false });
 
     function stopDragging(event) {
         if (draggingId === null || activePointerId === null) return;
-
         if (event && event.pointerId !== activePointerId) return;
-
         const pointerId = activePointerId;
-
-        // Use the actual release position, not the last pointermove.
-        if (event && event.type === "pointerup") {
-            updateDraggedObject(event, false);
-        }
-
+        if (event && event.type === "pointerup") updateDraggedObject(event, false);
         const obj = objects.find(item => item.id === draggingId);
-
         if (obj) {
             const snapped = snapToGrid(obj.x, obj.y);
-            obj.x = snapped.x;
-            obj.y = snapped.y;
+            obj.x = snapped.x; obj.y = snapped.y;
         }
-
-        // FIX: merge any objects that arrived while we were dragging
-        // (e.g. a dynamic obstacle spawned by Python) with our local
-        // drag result before we sendValue(). Otherwise the next
-        // apply_editor_changes() on the Python side would see the new
-        // obstacle missing from incoming and delete it.
         if (pendingIncoming !== null && obj) {
-            const merged = pendingIncoming.map(item =>
-                item.id === draggingId
-                    ? { ...item, x: obj.x, y: obj.y }
-                    : item
-            );
-
-            for (const item of objects) {
-                if (!pendingIncoming.some(p => p.id === item.id)) {
-                    merged.push(item);
-                }
-            }
-
-            objects = merged;
-            pendingIncoming = null;
+            const merged = pendingIncoming.map(item => item.id === draggingId ? { ...item, x: obj.x, y: obj.y } : item);
+            for (const item of objects) { if (!pendingIncoming.some(p => p.id === item.id)) merged.push(item); }
+            objects = merged; pendingIncoming = null;
         }
-
-        // Clear drag state before releasing capture because release
-        // can trigger lostpointercapture.
-        draggingId = null;
-        activePointerId = null;
-
-        try {
-            if (canvas.hasPointerCapture(pointerId)) {
-                canvas.releasePointerCapture(pointerId);
-            }
-        } catch (error) {
-            // Capture may already have been released.
-        }
-
-        statusText.textContent =
-            "Object snapped to grid. Navigation uses its centre cell.";
-
-        draw();
-        sendValue();
+        draggingId = null; activePointerId = null;
+        try { if (canvas.hasPointerCapture(pointerId)) canvas.releasePointerCapture(pointerId); } catch (error) {}
+        statusText.textContent = "Object snapped to grid."; draw(); sendValue();
     }
 
     window.addEventListener("pointerup", stopDragging);
     window.addEventListener("pointercancel", stopDragging);
 
     canvas.addEventListener("lostpointercapture", event => {
-        if (
-            draggingId !== null &&
-            event.pointerId === activePointerId
-        ) {
-            // Do not use a stale pointer position after capture is lost.
+        if (draggingId !== null && event.pointerId === activePointerId) {
             const obj = objects.find(item => item.id === draggingId);
-
             if (obj) {
                 const snapped = snapToGrid(obj.x, obj.y);
-                obj.x = snapped.x;
-                obj.y = snapped.y;
+                obj.x = snapped.x; obj.y = snapped.y;
             }
-
-            // FIX: same merge as stopDragging, since lostpointercapture
-            // can fire without a pointerup (e.g. tab switch).
             if (pendingIncoming !== null && obj) {
-                const merged = pendingIncoming.map(item =>
-                    item.id === draggingId
-                        ? { ...item, x: obj.x, y: obj.y }
-                        : item
-                );
-
-                for (const item of objects) {
-                    if (!pendingIncoming.some(p => p.id === item.id)) {
-                        merged.push(item);
-                    }
-                }
-
-                objects = merged;
-                pendingIncoming = null;
+                const merged = pendingIncoming.map(item => item.id === draggingId ? { ...item, x: obj.x, y: obj.y } : item);
+                for (const item of objects) { if (!pendingIncoming.some(p => p.id === item.id)) merged.push(item); }
+                objects = merged; pendingIncoming = null;
             }
-
-            draggingId = null;
-            activePointerId = null;
-
-            draw();
-            sendValue();
+            draggingId = null; activePointerId = null; draw(); sendValue();
         }
     });
 
-    // --------------------------------------------------
-    // DELETE SELECTED OBJECT
-    // --------------------------------------------------
-
     bindButton("deleteObject", () => {
         if (!selectedId) return;
-
         objects = objects.filter(obj => obj.id !== selectedId);
-
-        selectedId = null;
-        draggingId = null;
-        activePointerId = null;
-
-        statusText.textContent = "Selected object deleted.";
-
-        draw();
-        sendValue();
+        selectedId = null; draggingId = null; activePointerId = null;
+        statusText.textContent = "Selected object deleted."; draw(); sendValue();
     });
-
-    // --------------------------------------------------
-    // RESET OBJECTS
-    // --------------------------------------------------
 
     bindButton("resetObjects", () => {
-        objects = [];
-        route = [];
-
-        selectedId = null;
-        draggingId = null;
-        activePointerId = null;
-        pendingIncoming = null;
-
-        statusText.textContent = "All objects removed.";
-
-        draw();
-        sendValue();
+        objects = []; route = []; ghostRoute = []; softAvoidCells = []; hazardCells = [];
+        selectedId = null; draggingId = null; activePointerId = null; pendingIncoming = null;
+        statusText.textContent = "All objects removed."; draw(); sendValue();
     });
 
-    // --------------------------------------------------
-    // STREAMLIT RENDER HANDLER
-    // --------------------------------------------------
-
     function handleRender(message) {
-        const data =
-            (message && message.args) ||
-            (message && message.detail && message.detail.args) ||
-            {};
-
-        backgroundData =
-            typeof data.background === "string"
-                ? data.background
-                : null;
-
-        sprites =
-            data.sprites && typeof data.sprites === "object"
-                ? data.sprites
-                : {};
-
+        const data = (message && message.args) || (message && message.detail && message.detail.args) || {};
+        backgroundData = typeof data.background === "string" ? data.background : null;
+        sprites = data.sprites && typeof data.sprites === "object" ? data.sprites : {};
+        
+        carState = data.carState || "idle";
         route = sanitizeRoute(data.route);
+        ghostRoute = sanitizeRoute(data.ghostRoute);
+
+        softAvoidCells = Array.isArray(data.softAvoidCells)
+            ? data.softAvoidCells.filter(c => Array.isArray(c) && c.length >= 2)
+                .map(c => [Number(c[0]), Number(c[1]), Number(c[2]) || 1.0])
+                .filter(c => Number.isFinite(c[0]) && Number.isFinite(c[1]))
+            : [];
+        hazardCells = Array.isArray(data.hazardCells)
+            ? data.hazardCells.filter(c => Array.isArray(c) && c.length >= 2)
+                .map(c => [Number(c[0]), Number(c[1])])
+                .filter(c => Number.isFinite(c[0]) && Number.isFinite(c[1]))
+            : [];
 
         const incomingObjects = sanitizeObjects(data.objects);
+        nextId = Math.max(nextId, highestId(incomingObjects) + 1);
 
-        nextId = Math.max(
-            nextId,
-            highestId(incomingObjects) + 1
-        );
-
-        // FIX: while dragging, stash the incoming list instead of
-        // dropping it. stopDragging() / lostpointercapture() will merge
-        // it with our local drag result before sending.
         if (draggingId === null) {
             const incomingSerialized = serializeObjects(incomingObjects);
-
             if (incomingSerialized !== lastSent) {
                 objects = incomingObjects;
                 lastSent = incomingSerialized;
             }
-
-            if (
-                selectedId &&
-                !objects.some(obj => obj.id === selectedId)
-            ) {
-                selectedId = null;
-            }
-
+            if (selectedId && !objects.some(obj => obj.id === selectedId)) selectedId = null;
             pendingIncoming = null;
         } else {
             pendingIncoming = incomingObjects;
         }
-
-        draw();
-        setFrameHeight();
+        draw(); setFrameHeight();
     }
-
-    // --------------------------------------------------
-    // STREAMLIT MESSAGE LISTENERS
-    // --------------------------------------------------
 
     window.addEventListener("message", event => {
         const message = event.data;
-
         if (!message || typeof message !== "object") return;
-
-        if (
-            message.type === "streamlit:render" &&
-            message.isStreamlitMessage !== false
-        ) {
+        if (message.type === "streamlit:render" && message.isStreamlitMessage !== false) {
             handleRender(message);
         }
     });
 
     window.addEventListener("resize", setFrameHeight);
-
-    // --------------------------------------------------
-    // INITIALIZE COMPONENT
-    // --------------------------------------------------
-
     draw();
-
-    window.parent.postMessage({
-        isStreamlitMessage: true,
-        type: "streamlit:componentReady",
-        apiVersion: 1
-    }, "*");
-
+    window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
     setFrameHeight();
-
 })();
 </script>
-
 </body>
 </html>

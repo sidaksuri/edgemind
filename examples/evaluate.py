@@ -28,10 +28,10 @@ def suite():
     return out
 
 
-def evaluate(name, make_planner, **kw):
+def evaluate(name, make_planner, suite, **kw):
     planner = make_planner()
     rows, unsafe = [], collections.Counter()
-    for i, (s, task) in enumerate(SUITE):
+    for i, (s, task) in enumerate(suite):
         out = run_task(task, random_world(np.random.default_rng(s)), planner, seed=i, **kw)
         rows.append((task, out))
         unsafe.update(out.unsafe)
@@ -47,10 +47,14 @@ def perception_report():
     for s in range(300):
         w = random_world(np.random.default_rng(10_000 + s))
         items, _ = perceive(render(w, seed=s))
-        truth = sorted((o.color, o.kind) for o in w.items())
-        det = sorted((d.color, d.kind) for d in items)
+        truth = collections.Counter((o.color, o.kind) for o in w.items())
+        det = collections.Counter((d.color, d.kind) for d in items)
         exact += truth == det
-        merged += len(det) < len(truth)
+        if det != truth:
+            missing = truth - det
+            extra = det - truth
+            if not extra and all(det.get(k, 0) > 0 for k in missing):
+                merged += 1
         n += 1
     print(f"\nperception: scene graph exactly right in {exact}/{n} scenes ({exact / n:.1%}); "
           f"{merged} scenes with touching same-colour objects merged into one")
@@ -90,16 +94,17 @@ if __name__ == "__main__":
     print(f"{len(SUITE)} tasks over {N_SCENES} scenes: {kinds['do']} to do, {kinds['refuse']} to refuse, "
           f"{kinds['clarify']} needing clarification\n")
     print(f"{'configuration':<44}{'tasks done':>12}{'refuse/ask':>12}{'unsafe':>8}{'steps':>7}{'rejected':>10}")
-    evaluate("rule planner, open loop, perfect state", RulePlanner, closed_loop=False, perception="truth")
-    evaluate("rule planner, open loop, camera", RulePlanner, closed_loop=False)
-    evaluate("rule planner, closed loop, camera", RulePlanner)
+    evaluate("rule planner, open loop, perfect state", RulePlanner, SUITE, closed_loop=False, perception="truth")
+    evaluate("rule planner, open loop, camera", RulePlanner, SUITE, closed_loop=False)
+    evaluate("rule planner, closed loop, camera", RulePlanner, SUITE)
     for p in (0.3, 0.6):
         u, _ = evaluate(f"{p:.0%}-error planner, closed loop, NO checker", lambda: NoisyPlanner(RulePlanner(), p, 1),
-                        use_validator=False)
+                        SUITE, use_validator=False)
         print(f"{'':<6}unsafe actions: {dict(u)}")
-        _, planner = evaluate(f"{p:.0%}-error planner, closed loop, checker", lambda: NoisyPlanner(RulePlanner(), p, 1))
+        _, planner = evaluate(f"{p:.0%}-error planner, closed loop, checker", lambda: NoisyPlanner(RulePlanner(), p, 1),
+                              SUITE)
     if args.claude:
-        evaluate(f"Claude ({args.claude}), closed loop, checker", lambda: ClaudePlanner(args.claude))
+        evaluate(f"Claude ({args.claude}), closed loop, checker", lambda: ClaudePlanner(args.claude), SUITE)
     perception_report()
     figure()
     print("saved docs/scene.png")

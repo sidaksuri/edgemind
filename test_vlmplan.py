@@ -1,4 +1,4 @@
-# test_vlmplam.py
+# test_vlmplan.py
 import numpy as np
 import pytest
 

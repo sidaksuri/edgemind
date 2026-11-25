@@ -207,13 +207,29 @@ def astar(
     start: tuple[int, int],
     goal: tuple[int, int],
     soft_avoid_cells: Optional[set[tuple[int, int]]] = None,
-    soft_avoid_penalty: int = 100,
+    soft_avoid_weights: Optional[dict[tuple[int, int], float]] = None,
+    soft_avoid_penalty: float = 100,
 ) -> Optional[list[tuple[int, int]]]:
     """Find a path through the latest world state.
 
-    soft_avoid_cells adds a cost penalty to those cells, allowing
-    risk-weighted routing without blocking. Hard constraints
-    (world.blocked) still prevent traversal entirely.
+    Two soft-avoid APIs are supported so existing callers keep working:
+
+      soft_avoid_cells   -- set of (x,y) cells; each gets soft_avoid_penalty
+                            added to the step cost (default 100, i.e. very
+                            expensive but not hard-blocking).
+
+      soft_avoid_weights -- dict {(x,y): weight}. Stepping into a weighted
+                            cell costs 1.0 + weight. This is what the
+                            weighted-constraint agent uses, so the LLM's
+                            per-obstacle weight (e.g. 15.0 vs 3.0) directly
+                            shapes the route.
+
+    If both are provided, weights take priority for cells present in
+    both; cells present only in soft_avoid_cells use soft_avoid_penalty.
+
+    Hard constraints (world.blocked) always prevent traversal entirely.
+
+    Returns a path from start to goal, or None if unreachable.
     """
 
     if not world.inside_grid(*start):
@@ -222,15 +238,42 @@ def astar(
         return None
     if world.blocked(*start) or world.blocked(*goal):
         return None
+
+    start = (int(start[0]), int(start[1]))
+    goal = (int(goal[0]), int(goal[1]))
     if start == goal:
         return [start]
 
-    soft_avoid = soft_avoid_cells or set()
+    # Build the effective per-cell weight dictionary.
+    weights: dict[tuple[int, int], float] = {}
+
+    if soft_avoid_cells:
+        for cell in soft_avoid_cells:
+            if (
+                isinstance(cell, (list, tuple))
+                and len(cell) == 2
+            ):
+                key = (int(cell[0]), int(cell[1]))
+                weights[key] = float(soft_avoid_penalty)
+
+    if soft_avoid_weights:
+        for cell, w in soft_avoid_weights.items():
+            if (
+                isinstance(cell, (list, tuple))
+                and len(cell) == 2
+            ):
+                key = (int(cell[0]), int(cell[1]))
+                try:
+                    w_val = float(w)
+                except (TypeError, ValueError):
+                    continue
+                weights[key] = max(weights.get(key, 0.0), w_val)
+
     counter = itertools.count()
-    open_set = [(heuristic(start, goal), 0, next(counter), start)]
-    came_from = {}
-    g_score = {start: 0}
-    visited = set()
+    open_set = [(heuristic(start, goal), 0.0, next(counter), start)]
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    g_score: dict[tuple[int, int], float] = {start: 0.0}
+    visited: set[tuple[int, int]] = set()
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
     while open_set:
@@ -238,6 +281,7 @@ def astar(
         if current in visited:
             continue
         visited.add(current)
+
         if current == goal:
             path = [current]
             while current in came_from:
@@ -252,10 +296,10 @@ def astar(
                 continue
             if world.blocked(*neighbor):
                 continue
-            step_cost = 1 + (
-                soft_avoid_penalty if neighbor in soft_avoid else 0
-            )
+
+            step_cost = 1.0 + weights.get(neighbor, 0.0)
             tentative_cost = current_cost + step_cost
+
             if tentative_cost < g_score.get(neighbor, float("inf")):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_cost

@@ -7,9 +7,7 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Optional
 
-
 GRID_SIZE = 20
-
 
 @dataclass
 class Car:
@@ -25,7 +23,6 @@ class Car:
     def move_to(self, position: tuple[int, int]) -> None:
         self.x, self.y = position
 
-
 @dataclass
 class Obstacle:
     id: str
@@ -33,11 +30,14 @@ class Obstacle:
     y: int
     kind: str = "barrier"
     active: bool = True
+    speed: int = 0
+    dx: int = 0
+    dy: int = 0
+    fallout: int = 1
 
     @property
     def position(self) -> tuple[int, int]:
         return self.x, self.y
-
 
 @dataclass
 class DrivingWorld:
@@ -89,7 +89,7 @@ class DrivingWorld:
     def changes_since(self, revision):
         return [c for c in self.change_history if c["revision"] > revision]
 
-    def add_obstacle(self, x, y, kind="barrier", obstacle_id=None):
+    def add_obstacle(self, x, y, kind="barrier", obstacle_id=None, speed=0, dx=0, dy=0, fallout=1):
         if not self.inside_grid(x, y):
             raise ValueError("Obstacle position is outside the grid.")
         if self.occupied_by_car(x, y):
@@ -101,7 +101,11 @@ class DrivingWorld:
             self._next_obstacle_id += 1
         if obstacle_id in self.obstacles:
             raise ValueError(f"Obstacle ID already exists: {obstacle_id}")
-        obstacle = Obstacle(id=str(obstacle_id), x=x, y=y, kind=kind, active=True)
+        
+        obstacle = Obstacle(
+            id=str(obstacle_id), x=x, y=y, kind=kind, active=True,
+            speed=speed, dx=dx, dy=dy, fallout=fallout
+        )
         self.obstacles[obstacle.id] = obstacle
         self._record_change(
             "obstacle_added",
@@ -162,42 +166,6 @@ class DrivingWorld:
             {"destination": destination, "zone": zone},
         )
 
-    def describe(self):
-        lines = [
-            "CURRENT DRIVING WORLD",
-            f"Grid size: {GRID_SIZE} x {GRID_SIZE}",
-            f"Car position: {self.car.position}",
-            f"Car destination: {self.car.destination}",
-            f"World revision: {self.revision}",
-            "",
-            "ACTIVE OBSTACLES:",
-        ]
-        active = self.active_obstacles()
-        if not active:
-            lines.append("No active obstacles.")
-        else:
-            for obstacle in active:
-                lines.append(
-                    f"- {obstacle.id}: {obstacle.kind} at {obstacle.position}"
-                )
-        lines.append("")
-        lines.append("PARKING ZONES:")
-        for name, position in self.parking_zones.items():
-            state = "BLOCKED" if self.blocked(*position) else "AVAILABLE"
-            lines.append(f"- {name}: {position} ({state})")
-        return "\n".join(lines)
-
-    def snapshot(self):
-        return {
-            "revision": self.revision,
-            "car_position": self.car.position,
-            "destination": self.car.destination,
-            "obstacles": [
-                {"id": o.id, "kind": o.kind, "x": o.x, "y": o.y}
-                for o in self.active_obstacles()
-            ],
-        }
-
 
 def heuristic(current, goal):
     return abs(current[0] - goal[0]) + abs(current[1] - goal[1])
@@ -208,30 +176,43 @@ def astar(
     start: tuple[int, int],
     goal: tuple[int, int],
     soft_avoid_cells: Optional[set[tuple[int, int]]] = None,
-    soft_avoid_penalty: int = 100,
+    soft_avoid_weights: Optional[dict[tuple[int, int], float]] = None,
+    soft_avoid_penalty: float = 100,
 ) -> Optional[list[tuple[int, int]]]:
-    """Find a path through the latest world state.
 
-    soft_avoid_cells adds a cost penalty to those cells, allowing
-    risk-weighted routing without blocking. Hard constraints
-    (world.blocked) still prevent traversal entirely.
-    """
-
-    if not world.inside_grid(*start):
-        return None
-    if not world.inside_grid(*goal):
+    if not world.inside_grid(*start) or not world.inside_grid(*goal):
         return None
     if world.blocked(*start) or world.blocked(*goal):
         return None
+
+    start = (int(start[0]), int(start[1]))
+    goal = (int(goal[0]), int(goal[1]))
     if start == goal:
         return [start]
 
-    soft_avoid = soft_avoid_cells or set()
+    weights: dict[tuple[int, int], float] = {}
+
+    if soft_avoid_cells:
+        for cell in soft_avoid_cells:
+            if isinstance(cell, (list, tuple)) and len(cell) == 2:
+                key = (int(cell[0]), int(cell[1]))
+                weights[key] = float(soft_avoid_penalty)
+
+    if soft_avoid_weights:
+        for cell, w in soft_avoid_weights.items():
+            if isinstance(cell, (list, tuple)) and len(cell) == 2:
+                key = (int(cell[0]), int(cell[1]))
+                try:
+                    w_val = float(w)
+                except (TypeError, ValueError):
+                    continue
+                weights[key] = max(weights.get(key, 0.0), w_val)
+
     counter = itertools.count()
-    open_set = [(heuristic(start, goal), 0, next(counter), start)]
-    came_from = {}
-    g_score = {start: 0}
-    visited = set()
+    open_set = [(heuristic(start, goal), 0.0, next(counter), start)]
+    came_from: dict[tuple[int, int], tuple[int, int]] = {}
+    g_score: dict[tuple[int, int], float] = {start: 0.0}
+    visited: set[tuple[int, int]] = set()
     directions = [(1, 0), (-1, 0), (0, 1), (0, -1)]
 
     while open_set:
@@ -239,6 +220,7 @@ def astar(
         if current in visited:
             continue
         visited.add(current)
+
         if current == goal:
             path = [current]
             while current in came_from:
@@ -253,10 +235,10 @@ def astar(
                 continue
             if world.blocked(*neighbor):
                 continue
-            step_cost = 1 + (
-                soft_avoid_penalty if neighbor in soft_avoid else 0
-            )
+
+            step_cost = 1.0 + weights.get(neighbor, 0.0)
             tentative_cost = current_cost + step_cost
+
             if tentative_cost < g_score.get(neighbor, float("inf")):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_cost
@@ -267,13 +249,3 @@ def astar(
                 )
 
     return None
-
-
-def create_demo_world():
-    car = Car(x=1, y=10, destination=(18, 10), direction="east")
-    world = DrivingWorld(car=car)
-    world.add_obstacle(8, 10, kind="barrier")
-    world.add_obstacle(8, 11, kind="barrier")
-    world.add_obstacle(12, 7, kind="crate")
-    world.add_obstacle(13, 13, kind="cone")
-    return world
