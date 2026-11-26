@@ -32,6 +32,10 @@ class Obstacle:
     y: int
     kind: str = "barrier"
     active: bool = True
+    fallout: int = 1
+    speed: int = 0
+    dx: int = 0
+    dy: int = 0
 
     @property
     def position(self) -> tuple[int, int]:
@@ -88,7 +92,18 @@ class DrivingWorld:
     def changes_since(self, revision):
         return [c for c in self.change_history if c["revision"] > revision]
 
-    def add_obstacle(self, x, y, kind="barrier", obstacle_id=None):
+    def add_obstacle(
+        self,
+        x,
+        y,
+        kind="barrier",
+        obstacle_id=None,
+        *,
+        fallout: int = 1,
+        speed: int = 0,
+        dx: int = 0,
+        dy: int = 0,
+    ):
         if not self.inside_grid(x, y):
             raise ValueError("Obstacle position is outside the grid.")
         if self.occupied_by_car(x, y):
@@ -100,7 +115,17 @@ class DrivingWorld:
             self._next_obstacle_id += 1
         if obstacle_id in self.obstacles:
             raise ValueError(f"Obstacle ID already exists: {obstacle_id}")
-        obstacle = Obstacle(id=str(obstacle_id), x=x, y=y, kind=kind, active=True)
+        obstacle = Obstacle(
+            id=str(obstacle_id),
+            x=x,
+            y=y,
+            kind=kind,
+            active=True,
+            fallout=int(fallout),
+            speed=int(speed),
+            dx=int(dx),
+            dy=int(dy),
+        )
         self.obstacles[obstacle.id] = obstacle
         self._record_change(
             "obstacle_added",
@@ -192,7 +217,16 @@ class DrivingWorld:
             "car_position": self.car.position,
             "destination": self.car.destination,
             "obstacles": [
-                {"id": o.id, "kind": o.kind, "x": o.x, "y": o.y}
+                {
+                    "id": o.id,
+                    "kind": o.kind,
+                    "x": o.x,
+                    "y": o.y,
+                    "fallout": o.fallout,
+                    "speed": o.speed,
+                    "dx": o.dx,
+                    "dy": o.dy,
+                }
                 for o in self.active_obstacles()
             ],
         }
@@ -224,8 +258,7 @@ def astar(
                             per-obstacle weight (e.g. 15.0 vs 3.0) directly
                             shapes the route.
 
-    If both are provided, weights take priority for cells present in
-    both; cells present only in soft_avoid_cells use soft_avoid_penalty.
+    If a cell appears in both, the HIGHER of the two weights wins.
 
     Hard constraints (world.blocked) always prevent traversal entirely.
 
@@ -244,24 +277,17 @@ def astar(
     if start == goal:
         return [start]
 
-    # Build the effective per-cell weight dictionary.
     weights: dict[tuple[int, int], float] = {}
 
     if soft_avoid_cells:
         for cell in soft_avoid_cells:
-            if (
-                isinstance(cell, (list, tuple))
-                and len(cell) == 2
-            ):
+            if isinstance(cell, (list, tuple)) and len(cell) == 2:
                 key = (int(cell[0]), int(cell[1]))
                 weights[key] = float(soft_avoid_penalty)
 
     if soft_avoid_weights:
         for cell, w in soft_avoid_weights.items():
-            if (
-                isinstance(cell, (list, tuple))
-                and len(cell) == 2
-            ):
+            if isinstance(cell, (list, tuple)) and len(cell) == 2:
                 key = (int(cell[0]), int(cell[1]))
                 try:
                     w_val = float(w)

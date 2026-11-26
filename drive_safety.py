@@ -1,5 +1,4 @@
 """Runtime safety shield for EdgeMind (single canonical path validator)."""
-# drive_safety.py
 from vlmplan.drive_world import DrivingWorld
 
 

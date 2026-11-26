@@ -1,6 +1,4 @@
-﻿## drive_app.py
-
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import copy
@@ -114,6 +112,7 @@ DEFAULTS = {
     "car_sprite": None,
     "cone_sprite": None,
     "barrier_sprite": None,
+    "opposition_car_sprite": None,
     "editor_revision": 0,
     "drive_world": None,
     "drive_agent": None,
@@ -876,9 +875,14 @@ st.sidebar.divider(); st.sidebar.subheader("Sprites")
 car_up = st.sidebar.file_uploader("Car", type=["png", "jpg", "jpeg"])
 cone_up = st.sidebar.file_uploader("Cone", type=["png", "jpg", "jpeg"])
 bar_up = st.sidebar.file_uploader("Barrier", type=["png", "jpg", "jpeg"])
+opp_up = st.sidebar.file_uploader(
+    "Opposition car (optional)", type=["png", "jpg", "jpeg"],
+    help="Sprite used for opposition_car obstacles. Leave empty to reuse the main car sprite.",
+)
 if car_up: st.session_state.car_sprite = image_to_data_uri(car_up, (180, 180))
 if cone_up: st.session_state.cone_sprite = image_to_data_uri(cone_up, (180, 180))
 if bar_up: st.session_state.barrier_sprite = image_to_data_uri(bar_up, (180, 180))
+if opp_up: st.session_state.opposition_car_sprite = image_to_data_uri(opp_up, (180, 180))
 
 st.title("🚗 EdgeMind — Driving Digital Twin")
 st.caption("Hierarchical control: **LLM extracts weighted constraints** → **A* plans risk-aware routes** → **runtime safety tier validates every step**")
@@ -908,6 +912,7 @@ def main_panel():
         ("drive_world", None),
         ("drive_agent", None),
         ("last_plan_status", "No route planned yet."),
+        ("opposition_car_sprite", None),
         ("_opp_targets", {}),
         ("_step_consumed_this_run", False),
     ):
@@ -1054,8 +1059,12 @@ def main_panel():
             "car": st.session_state.car_sprite,
             "cone": st.session_state.cone_sprite,
             "barrier": st.session_state.barrier_sprite,
-            # FIX #3: traffic cars should not render with the cone sprite.
+            # Traffic and opposition cars use car sprites, not cone sprites.
             "traffic_car": st.session_state.car_sprite,
+            "opposition_car": (
+                st.session_state.opposition_car_sprite
+                or st.session_state.car_sprite
+            ),
         },
         objects=st.session_state.editor_objects,
         route=st.session_state.planned_route,
@@ -1223,3 +1232,4 @@ with st.expander("📖 Defensible claims (open before defense)"):
 11. **Constraint field survives replans.** `REPLAN_PROMPT` deliberately omits `avoid_obstacles` and `safety_vs_time`; `DriveDecision` uses `None` (not `[]`/`0.5`) as the "field absent" sentinel, and `_apply_navigate_decision` leaves the original instruction's weighted constraint field untouched when those fields are `None`.
 12. **Coordinate snap recovers VLM drift.** `_refresh_soft_avoid_weights` snaps each LLM obstacle spec to the nearest live obstacle of the same kind within `SNAP_RADIUS` (Manhattan), logging each snap. Without this, a 1-cell hallucination would silently collapse the entire weight field to `{}` and make ghost == active with no explanation.
 """)
+"""Ollama-based constraint extractor for EdgeMind driving."""
